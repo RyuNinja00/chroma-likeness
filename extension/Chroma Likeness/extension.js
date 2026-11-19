@@ -701,7 +701,8 @@ async function render(prompt, reference, ratio, token = undefined, model = saved
     : clean;
   // A picture of a saved outfit goes in as image 2, for the clothes only.
   const outfitBlob = outfitRef?.blob && reference && !pair && !raw && (!meta?.maxInputs || meta.maxInputs >= 2) ? outfitRef.blob : null;
-  const outfitNote = outfitBlob ? "Image 2 shows the outfit (" + outfitRef.title + "): copy only its clothing, shoes and accessories; the person’s face, hair and build come from image 1." : "";
+  const outfitNote = outfitBlob ? "Image 2 shows the outfit (" + outfitRef.title + "): copy only its clothing, shoes and accessories; the person’s face, hair and build come from image 1." +
+    (outfitRef.notes?.length ? " Get these right: " + outfitRef.notes.slice(0, 4).join("; ") + "." : "") : "";
   if (outfitNote) submitted = outfitNote + "\n" + submitted;
   const tagged = !reference && !pair && wantsTags(model);
   if (!raw) submitted = (tagged ? "adults only, " : adultAnchor + " ") + submitted;
@@ -826,11 +827,18 @@ function videoEnabled() {
   return config.videoOn !== false && Boolean(modelFor("video"));
 }
 async function sceneState(chat) {
-  return (chat && (await store("settings", "get", "state/" + chat))) || { outfits: {}, mood: null };
+  const st = (chat && (await store("settings", "get", "state/" + chat))) || { outfits: {}, mood: null };
+  // An outfit worn from the wardrobe follows its saved description, which feedback may have improved.
+  for (const [id, key] of Object.entries(st.outfitKeys || {})) {
+    const item = key && (await readCloset(id).catch(() => [])).find((i) => i.key === key);
+    if (item) st.outfits = { ...st.outfits, [id]: item.outfit };
+  }
+  return st;
 }
 async function saveSceneState(chat, patch) {
   const current = await sceneState(chat);
-  const next = { ...current, ...patch, outfits: { ...current.outfits, ...(patch.outfits || {}) } };
+  const keys = Object.fromEntries(Object.entries({ ...(current.outfitKeys || {}), ...(patch.outfitKeys || {}) }).filter(([, v]) => v));
+  const next = { ...current, ...patch, outfits: { ...current.outfits, ...(patch.outfits || {}) }, outfitKeys: keys };
   await store("settings", "put", "state/" + chat, next);
   return next;
 }
@@ -857,25 +865,37 @@ async function absorbState(chat, people, result) {
     if (person && typeof outfit === "string" && outfit.trim()) outfits[person.id] = outfit.trim().slice(0, 600);
   }
   const find = (name) => people.find((p) => p.name.toLowerCase() === String(name).toLowerCase() || p.id === name);
+  // Still in the saved outfit? Keep its (possibly improved) description; otherwise she changed.
+  const before = await sceneState(chat), keys = {};
+  for (const [id, text] of Object.entries(outfits)) {
+    const key = before.outfitKeys?.[id];
+    if (!key) continue;
+    const item = (await readCloset(id).catch(() => [])).find((i) => i.key === key);
+    if (item && sameOutfit(text, item.outfit)) outfits[id] = item.outfit; else keys[id] = null;
+  }
   // Outfits asked to go into the wardrobe: named, detailed and never pruned.
   for (const add of Array.isArray(result.wardrobeAdd) ? result.wardrobeAdd.slice(0, 3) : []) {
     const person = find(add?.name), outfit = String(add?.outfit || "").trim();
     if (!person || outfit.length < 8) continue;
     const title = String(add.title || "").trim().slice(0, 60) || outfit.slice(0, 40);
-    if (await addToCloset(person.id, outfit, false, title).catch(() => false)) tell("Saved to " + person.name + "’s wardrobe: " + title + ".");
+    const key = await addToCloset(person.id, outfit, false, title).catch(() => false);
+    if (!key) continue;
+    tell("Saved to " + person.name + "’s wardrobe: " + title + ".");
+    if (sameOutfit(outfits[person.id] || before.outfits?.[person.id] || "", outfit)) { outfits[person.id] = outfit; keys[person.id] = key; }
   }
   // "Put on the red dress": wear a saved outfit.
   for (const [name, title] of Object.entries(result.wear && typeof result.wear === "object" ? result.wear : {})) {
     const person = find(name), item = person && (await findClosetItem(person.id, title).catch(() => null));
     if (!item) continue;
     outfits[person.id] = item.outfit;
+    keys[person.id] = item.key;
     tell(person.name + " is wearing: " + (item.title || item.outfit.slice(0, 60)) + ".");
   }
   const level = Number(result.mood?.level);
   const mood = Number.isFinite(level)
     ? { level: Math.max(0, Math.min(10, Math.round(level))), note: String(result.mood?.note || "").slice(0, 60) }
     : undefined;
-  const next = await saveSceneState(chat, { outfits, ...(mood ? { mood } : {}) });
+  const next = await saveSceneState(chat, { outfits, outfitKeys: keys, ...(mood ? { mood } : {}) });
   for (const [id, outfit] of Object.entries(outfits)) addToCloset(id, outfit, true).catch(() => {});
   if (chat === chatId) paintState().catch(() => {});
   return next;
@@ -945,6 +965,14 @@ async function deliver(chat, character, results, pictured, lockFlags = [], conte
     await store("settings", "put", "lockedIndex", index);
   }
   await postMedia(chat, character, items, pictured, lockFlags.some(Boolean) ? { likenessLocked: true } : {}, content);
+  if (pictured.length === 1 && results[0]?.model !== "scene photo") {
+    for (const it of items) {
+      const item = await wornItem(chat, pictured[0]).catch(() => null);
+      if (!item) break;
+      const path = imgPath(it.url), lock = index[path];
+      await addOutfitPicture(pictured[0], item, lock ? imgPath(lock.real.url) : path).catch(() => {});
+    }
+  }
   return items;
 }
 async function unlockPhoto(path) {
@@ -997,6 +1025,15 @@ async function animatePicture(row, character) {
 function normOutfit(s) {
   return String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
+// Two descriptions of the same outfit: most words of the shorter one appear in the longer one.
+function sameOutfit(a, b) {
+  const wa = new Set(normOutfit(a).split(" ").filter((w) => w.length > 2)), wb = new Set(normOutfit(b).split(" ").filter((w) => w.length > 2));
+  if (!wa.size || !wb.size) return false;
+  if (normOutfit(a) === normOutfit(b)) return true;
+  let shared = 0;
+  for (const w of wa) if (wb.has(w)) shared++;
+  return shared / Math.min(wa.size, wb.size) >= 0.6;
+}
 function closetExt(id, map) {
   const [owner, slot] = id.split("~friend~");
   return { owner, extensions: slot ? { chromaLikenessFriends: { [slot]: { closet: map } } } : { chromaLikenessCloset: map } };
@@ -1023,13 +1060,14 @@ async function addToCloset(id, outfit, auto = false, title = "") {
     // Saving something already collected keeps it for good, with its name and the fuller description.
     if (auto || (!same.auto && (!title || same.title === title) && same.outfit.length >= outfit.length)) return false;
     await writeCloset(id, { [same.key]: { outfit: outfit.length > same.outfit.length ? outfit : same.outfit, auto: false, ...(title ? { title } : {}), at: Date.now() } });
-    return true;
+    return same.key;
   }
-  const map = { ["o" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)]: { outfit, auto, ...(title ? { title } : {}), at: Date.now() } };
+  const newKey = "o" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const map = { [newKey]: { outfit, auto, ...(title ? { title } : {}), at: Date.now() } };
   const autos = items.filter((i) => i.auto);
   if (auto && autos.length >= 15) for (const old of autos.slice(14)) map[old.key] = null;
   await writeCloset(id, map);
-  return true;
+  return newKey;
 }
 async function findClosetItem(id, title) {
   const want = normOutfit(title);
@@ -1038,19 +1076,51 @@ async function findClosetItem(id, title) {
   return items.find((i) => normOutfit(i.title) === want) || items.find((i) => i.title && (normOutfit(i.title).includes(want) || want.includes(normOutfit(i.title))))
     || items.find((i) => normOutfit(i.outfit).includes(want)) || null;
 }
-// The first picture of a saved outfit is kept with it and shows the clothes in later pictures.
-async function rememberOutfitPicture(id, outfit, item) {
-  if (!item?.url) return;
-  const item2 = (await readCloset(id)).find((i) => !i.auto && !i.picture && normOutfit(i.outfit) === normOutfit(outfit));
-  if (!item2) return;
-  const path = imgPath(item.url), lock = (await lockedEntries())[path];
-  await writeCloset(id, { [item2.key]: { picture: lock ? imgPath(lock.real.url) : path } });
+// The saved outfit a person wears in a chat: by its key, else a saved outfit matching the description.
+async function wornItem(chat, id) {
+  if (!chat || !id) return null;
+  const st = (await store("settings", "get", "state/" + chat)) || {};
+  const items = await readCloset(id).catch(() => []);
+  const key = st.outfitKeys?.[id];
+  return (key && items.find((i) => i.key === key)) || items.find((i) => !i.auto && st.outfits?.[id] && sameOutfit(i.outfit, st.outfits[id])) || null;
 }
-async function outfitPicture(id, outfit) {
-  const item = (await readCloset(id).catch(() => [])).find((i) => i.picture && normOutfit(i.outfit) === normOutfit(outfit));
-  if (!item) return null;
+// Every picture of someone in a saved outfit is filed with it; the first one becomes its reference.
+async function addOutfitPicture(id, item, path) {
+  if (!path || item.pictures?.includes(path)) return;
+  await writeCloset(id, { [item.key]: { pictures: [path, ...(item.pictures || [])].slice(0, 24), ...(item.picture ? {} : { picture: path }) } });
+}
+// The outfit's reference picture (and what feedback taught it), for the edit model.
+async function outfitPicture(chat, id) {
+  const item = await wornItem(chat, id).catch(() => null);
+  if (!item?.picture) return null;
   const blob = await getPicture(item.picture).catch(() => null);
-  return blob ? { blob, title: item.title || "the saved outfit" } : null;
+  return blob ? { blob, title: item.title || "the saved outfit", notes: item.notes || [] } : null;
+}
+// 👍/👎 on a photo of an outfit: the vision model compares it with the outfit's reference picture and
+// rewrites the description so later pictures get the clothes right, keeping a short correction.
+async function rateOutfit(id, key, path, direction) {
+  const item = (await readCloset(id)).find((i) => i.key === key);
+  if (!item) throw Error("That outfit is no longer in the wardrobe.");
+  if (item.votes?.[path] === direction) { await writeCloset(id, { [key]: { votes: { [path]: null } } }); return "Rating removed."; }
+  const patch = { votes: { [path]: direction } };
+  if (direction === "up" && !item.picture) patch.picture = path;
+  let msg = direction === "up" ? "Marked as a good picture of this outfit." : "Marked as a poor picture of this outfit.";
+  if (modelFor("vision")) {
+    const two = Boolean(item.picture && item.picture !== path);
+    const blobs = two ? [await getPicture(item.picture), await getPicture(path)] : [await getPicture(path)];
+    const verdict = direction === "up" ? "GOOD (it shows the outfit right)" : "POOR (it gets the outfit wrong)";
+    const result = await inspectPhoto(blobs,
+      (two ? 'LEFT is the approved picture of the outfit "' + (item.title || "this outfit") + '". RIGHT is a new picture the user rated ' : 'This picture of the outfit "' + (item.title || "this outfit") + '" was rated ') + verdict +
+      '. The written description is: "' + item.outfit.slice(0, 1200) + '". Look only at clothing, shoes and accessories; ignore the person, pose, lighting and setting. ' +
+      'Return {"description":"<the description rewritten so future pictures get the outfit right: keep what is correct, fix or sharpen what the rated picture got wrong (for a good rating, add the details it got right); every garment with colour, fabric, cut, length and fit, plus shoes and accessories; under 900 characters>","note":"<one short instruction that would have fixed the rated picture, or empty if nothing is wrong>"}');
+    const description = typeof result?.description === "string" ? result.description.trim() : "";
+    const tip = typeof result?.note === "string" ? result.note.trim().slice(0, 160) : "";
+    if (description.length >= 20 && normOutfit(description) !== normOutfit(item.outfit)) { patch.prevOutfit = item.outfit; patch.outfit = description.slice(0, 1200); }
+    if (tip) patch.notes = [tip, ...(item.notes || []).filter((x) => x !== tip)].slice(0, 6);
+    msg += patch.outfit ? " Description updated" + (tip ? "; learned: " + tip : "") + "." : tip ? " Learned: " + tip + "." : " The description already matches.";
+  } else msg += " Choose a vision model in Settings to learn from ratings.";
+  await writeCloset(id, { [key]: patch });
+  return msg;
 }
 // Gallery prompts hold the full technical request; keep only the scene for chat captions.
 function cleanCaption(prompt) {
@@ -2021,14 +2091,12 @@ async function pollContext(w, chat = chat, force = false) {
   const styled=composeScene(plan.scene,plan.shot,ctx);
   const scene=refs[0] ? styled : [first.name,first.appearance,styled].filter(Boolean).join(". ");
   // A saved outfit with a picture of it: that picture shows the edit model the clothes.
-  const wearing=(next || state).outfits?.[first.id];
-  const outfitRef=!second && refs[0] && wearing ? await outfitPicture(first.id, wearing) : null;
+  const outfitRef=!second && refs[0] ? await outfitPicture(chat, first.id) : null;
   const rendered=await render(scene,refs[0]?.blob,framingFor(plan.raw,ctx),undefined,undefined,traitsForEdit(refs[0]),pair,false,plan.scene,outfitRef);
   if (!await stillCurrent()) { await upload(chat,rendered); setStatus(chat, "The chat moved on before the picture was ready; it is in the Gallery."); return; }
   const ids=plan.people.map(c=>c.id);
   const locked=shouldLock(next?.mood || state.mood);
-  const sent=await deliver(chat,latest.characterId || first.owner || first.id,[rendered],ids,[locked]);
-  if (!second && wearing) rememberOutfitPicture(first.id, wearing, sent[0]).catch(() => {});
+  await deliver(chat,latest.characterId || first.owner || first.id,[rendered],ids,[locked]);
   setStatus(chat, (photoTaken ? "Pictured the photo taken in the story: " : "Picture posted: ") + plan.people.map(c=>c.name).join(" + ") + (locked ? " (locked)." : "."));
   await store("settings","put","lastScene/"+chat+"/"+ids.slice().sort().join("|"),plan.scene);
   tell((plan.unprompted&&!userAsked?(ctx.arena==="conversation"?"She sent a photo on her own: ":"Illustrated a story beat: "):"Picture posted: ")+plan.people.map(c=>c.name).join(" + ")+(locked?" (locked).":"."));
@@ -2156,11 +2224,12 @@ async function paintCloset() {
   options(closetSelect, items.length
     ? items.map((i) => [i.key, (i.auto ? "" : "★ ") + (i.title ? i.title + " · " : "") + i.outfit.slice(0, 90) + (i.picture ? " 📷" : "")])
     : [["", "Empty · photos and Save to closet fill it"]]);
+  paintWardrobe().catch(() => {});
 }
 const closetControls = node("div", undefined, "actions");
 create.append(closetControls);
-async function wearOutfit(id, outfit) {
-  await saveSceneState(chatId, { outfits: { [id]: outfit } });
+async function wearOutfit(id, outfit, key = null) {
+  await saveSceneState(chatId, { outfits: { [id]: outfit }, outfitKeys: { [id]: key } });
   await paintState();
 }
 button(closetControls, "Wear it", async () => {
@@ -2168,7 +2237,7 @@ button(closetControls, "Wear it", async () => {
   if (!chatId || !id || !closetSelect.value) throw Error("Choose a character and a closet outfit first.");
   const item = (await readCloset(id)).find((i) => i.key === closetSelect.value);
   if (!item) throw Error("That outfit is no longer in the closet.");
-  await wearOutfit(id, item.outfit);
+  await wearOutfit(id, item.outfit, item.key);
   note("Wearing: " + item.outfit + ". The next draft, set or contextual photo starts from it.");
 });
 button(closetControls, "Surprise me", async () => {
@@ -2176,7 +2245,8 @@ button(closetControls, "Surprise me", async () => {
   if (!chatId || !c) throw Error("Select a chat and character first.");
   const state = await sceneState(chatId);
   const items = (await readCloset(id)).filter((i) => normOutfit(i.outfit) !== normOutfit(state.outfits?.[id]));
-  let outfit = items.length ? items[Math.floor(Math.random() * items.length)].outfit : "";
+  const pick = items.length ? items[Math.floor(Math.random() * items.length)] : null;
+  let outfit = pick?.outfit || "";
   if (!outfit) {
     const json = replyJson(await chatCompletion({ model: modelFor("writer"), max_tokens: 500, messages: [
       { role: "system", content: 'Invent one outfit for ' + c.name + ' to wear next. Return JSON only: {"outfit":"<under 200 characters>"}. It should suit localTime and the recent chat. Tone: ' + heatRule(state.mood) },
@@ -2186,7 +2256,7 @@ button(closetControls, "Surprise me", async () => {
     if (!outfit) throw Error("The writing model did not suggest an outfit.");
     await addToCloset(id, outfit, false);
   }
-  await wearOutfit(id, outfit);
+  await wearOutfit(id, outfit, pick?.key || null);
   await paintCloset();
   note("Surprise: " + outfit + ".");
 });
@@ -2217,6 +2287,162 @@ button(create, "Send dare (1 text call + 3 paid images)", async () => {
   dareInput.value = "";
   await makeSet(chatId, c, null, 3, "", dare);
 });
+// ---------- Wardrobe: a thumbnail per outfit, and a folder for each ----------
+const wardrobeSection = section("Wardrobe");
+wardrobeSection.append(node("small", "Outfits of the character chosen under Generate a picture. The thumbnail is the outfit’s reference picture (♡ in its folder changes it). Tap an outfit to see its photos, rate them, and edit what it learned."));
+const wardrobeGrid = node("div", undefined, "pictures wardrobe");
+wardrobeSection.append(wardrobeGrid);
+function tally(votes, dir) {
+  return Object.values(votes || {}).filter((v) => v === dir).length;
+}
+async function paintWardrobe() {
+  const id = characterSelect.value;
+  if (!id) { wardrobeGrid.replaceChildren(node("small", "Choose a character under Generate a picture.")); return; }
+  const items = (await readCloset(id).catch(() => [])).sort((a, b) => (a.auto - b.auto) || (b.at || 0) - (a.at || 0));
+  const worn = chatId ? await wornItem(chatId, id).catch(() => null) : null;
+  wardrobeGrid.replaceChildren(...(items.length ? items.map((i) => {
+    const tile = node("button", undefined, "outfit-tile");
+    tile.type = "button";
+    if (i.picture) { const img = node("img"); img.src = i.picture; img.alt = i.title || "Outfit"; img.loading = "lazy"; tile.append(img); }
+    else tile.append(node("span", "👗", "outfit-empty"));
+    const ups = tally(i.votes, "up"), downs = tally(i.votes, "down");
+    tile.append(node("strong", (i.auto ? "" : "★ ") + (i.title || i.outfit.slice(0, 40))),
+      node("small", [worn?.key === i.key ? "wearing now" : "", (i.pictures?.length || 0) + " photos", ups || downs ? "👍" + ups + " 👎" + downs : "", i.auto ? "collected" : ""].filter(Boolean).join(" · ")));
+    tile.onclick = () => openOutfit(id, i.key).catch(fail);
+    return tile;
+  }) : [node("small", "No outfits yet. Ask her in the chat to add one to her wardrobe, or use Save current to closet.")]));
+}
+// The outfit folder opens over the panel.
+const outfitBox = node("dialog");
+outfitBox.id = "chroma-likeness-wardrobe";
+document.body.append(outfitBox);
+const outfitOut = node("output");
+let openedOutfit = null, deleteArmed = false;
+async function openOutfit(id, key) {
+  openedOutfit = { id, key };
+  deleteArmed = false;
+  outfitOut.textContent = "";
+  await paintOutfit();
+  if (!outfitBox.open) outfitBox.showModal();
+}
+function outfitButton(parent, title, fn, tip = "") {
+  const b = node("button", title);
+  b.type = "button";
+  if (tip) b.title = tip;
+  b.onclick = () => action(async () => {
+    try { outfitOut.textContent = "Working…"; outfitOut.textContent = (await fn()) || ""; }
+    catch (e) { outfitOut.textContent = e.message || String(e); throw e; }
+    finally { await paintOutfit().catch(() => {}); paintWardrobe().catch(() => {}); }
+  });
+  parent.append(b);
+  return b;
+}
+async function pictureOutfit(id, item) {
+  const c = cards.find((x) => x.id === id);
+  if (!chatId || !c) throw Error("Select a chat with this character first.");
+  const ref = await cardReference(id);
+  await saveSceneState(chatId, { outfits: { [id]: item.outfit }, outfitKeys: { [id]: item.key } });
+  const ctx = await pictureContext(chatId, [c]);
+  const scene = composeScene(c.name + " standing full-length, showing off the whole outfit: " + item.outfit, "full-body photo", ctx);
+  const outfitRef = item.picture ? { blob: await getPicture(item.picture), title: item.title || "the outfit", notes: item.notes || [] } : null;
+  const result = await render(ref ? scene : [c.name, c.appearance, scene].filter(Boolean).join(". "), ref?.blob, "3:4", undefined, undefined, traitsForEdit(ref), null, false,
+    (item.title || "Outfit") + ": full-length photo", outfitRef);
+  await deliver(chatId, c.owner || c.id, [result], [id], [false]);
+  paintState().catch(() => {});
+  return "Posted " + c.name + " in " + (item.title || "the outfit") + costText(result) + ".";
+}
+async function paintOutfit() {
+  if (!openedOutfit) return;
+  const { id, key } = openedOutfit;
+  const item = (await readCloset(id).catch(() => [])).find((i) => i.key === key);
+  const who = cards.find((c) => c.id === id);
+  const head = node("header");
+  const close = node("button", "Close");
+  close.type = "button";
+  close.onclick = () => outfitBox.close();
+  head.append(node("h2", (who?.name ? who.name + " · " : "") + (item?.title || "Outfit")), close);
+  if (!item) { outfitBox.replaceChildren(head, node("p", "That outfit is no longer in the wardrobe.")); return; }
+  const body = node("div", undefined, "section");
+  if (item.picture) {
+    const ref = node("img", undefined, "outfit-ref");
+    ref.src = item.picture;
+    ref.alt = "Reference picture";
+    body.append(ref, node("small", "Reference picture · shows the clothes to the edit model, and is the wardrobe thumbnail."));
+  } else body.append(node("small", "No reference picture yet: the first photo of this outfit, or the first you mark 👍 or ♡, becomes it."));
+  const title = label(body, "Name", node("input"));
+  title.value = item.title || "";
+  title.maxLength = 60;
+  const text = label(body, "Description · used in every picture of this outfit; ratings refine it", node("textarea"));
+  text.rows = 6;
+  text.value = item.outfit;
+  if (item.notes?.length) {
+    body.append(node("small", "Learned from ratings (added to every picture of this outfit):"));
+    const list = node("ul", undefined, "outfit-notes");
+    for (const n of item.notes) {
+      const li = node("li", n + " ");
+      outfitButton(li, "✕", async () => {
+        await writeCloset(id, { [key]: { notes: (item.notes || []).filter((x) => x !== n) } });
+        return "Removed that note.";
+      }, "Forget this note");
+      list.append(li);
+    }
+    body.append(list);
+  }
+  const actions = node("div", undefined, "actions");
+  outfitButton(actions, "Save changes", async () => {
+    const outfit = text.value.trim();
+    if (outfit.length < 4) throw Error("Describe the outfit first.");
+    await writeCloset(id, { [key]: { title: title.value.trim() || null, outfit, ...(outfit !== item.outfit ? { prevOutfit: item.outfit } : {}) } });
+    return "Saved.";
+  });
+  if (item.prevOutfit) outfitButton(actions, "Undo last change", async () => {
+    await writeCloset(id, { [key]: { outfit: item.prevOutfit, prevOutfit: item.outfit } });
+    return "Restored the previous description.";
+  });
+  outfitButton(actions, "Wear it in this chat", async () => {
+    if (!chatId) throw Error("Select a chat first.");
+    await wearOutfit(id, item.outfit, key);
+    return (who?.name || "She") + " is wearing it in this chat; the next picture starts from it.";
+  });
+  outfitButton(actions, "Picture her in it (1 paid image)", () => pictureOutfit(id, item));
+  if (item.auto) outfitButton(actions, "Keep for good", async () => {
+    await writeCloset(id, { [key]: { auto: false } });
+    return "Kept: collected outfits can be replaced, kept ones never are.";
+  });
+  outfitButton(actions, deleteArmed ? "Tap again to delete" : "Delete outfit", async () => {
+    if (!deleteArmed) { deleteArmed = true; return "Tap Delete again to remove this outfit and its ratings."; }
+    await writeCloset(id, { [key]: null });
+    outfitBox.close();
+    openedOutfit = null;
+    return "";
+  });
+  body.append(actions, outfitOut);
+  const photos = node("div", undefined, "pictures");
+  for (const path of item.pictures || []) {
+    const fig = node("figure");
+    const img = node("img");
+    img.src = path;
+    img.alt = "Outfit photo";
+    img.loading = "lazy";
+    const row = node("div", undefined, "actions");
+    const vote = item.votes?.[path];
+    outfitButton(row, item.picture === path ? "♥" : "♡", async () => {
+      await writeCloset(id, { [key]: { picture: path } });
+      return "This photo now shows the clothes in new pictures, and is the wardrobe thumbnail.";
+    }, "Use as the outfit’s reference picture");
+    outfitButton(row, vote === "up" ? "👍✓" : "👍", () => rateOutfit(id, key, path, "up"), "Shows the outfit right");
+    outfitButton(row, vote === "down" ? "👎✓" : "👎", () => rateOutfit(id, key, path, "down"), "Gets the outfit wrong");
+    outfitButton(row, "✕", async () => {
+      const rest = (item.pictures || []).filter((x) => x !== path);
+      await writeCloset(id, { [key]: { pictures: rest, votes: { [path]: null }, ...(item.picture === path ? { picture: rest[0] || null } : {}) } });
+      return "Removed from this outfit (it stays in the Gallery).";
+    }, "Remove from this outfit");
+    fig.append(img, row);
+    photos.append(fig);
+  }
+  body.append(node("small", (item.pictures?.length ? item.pictures.length + " photos of this outfit · rate how well each shows the clothes" : "No photos of this outfit yet: Picture her in it, or have her wear it in a chat.")), photos);
+  outfitBox.replaceChildren(head, body);
+}
 // Shared by drafts and photo sets: recent chat as text, oldest first.
 async function chatText(id, limit = 6) {
   const messages = await host("/chats/" + enc(id) + "/messages?limit=" + limit);
@@ -3114,6 +3340,7 @@ marinara.onCleanup(() => {
   if (previewUrl) URL.revokeObjectURL(previewUrl);
   feedbackToast.remove();inline.remove();
   panel.remove();
+  document.getElementById("chroma-likeness-wardrobe")?.remove();
   launcher.remove();
   flushServer().catch(() => {});
   dbPromise.then((db) => db.close()).catch(() => {});

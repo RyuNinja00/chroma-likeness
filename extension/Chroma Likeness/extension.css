@@ -125,3 +125,28 @@
 .chroma-likeness-toast {position:fixed;bottom:52px;left:12px;max-width:min(460px,90vw);padding:9px 14px;border-radius:8px;background:#342739;color:white;z-index:2147481001}
 
 #chroma-likeness-panel [hidden] { display: none !important; }
+
+/* Wardrobe thumbnails and the outfit folder */
+#chroma-likeness-panel .wardrobe .outfit-tile { display: grid; gap: 4px; padding: 6px; text-align: left; }
+#chroma-likeness-panel .wardrobe .outfit-tile img { height: 150px; border-radius: 5px; }
+#chroma-likeness-panel .wardrobe .outfit-empty { display: grid; place-items: center; height: 150px; font-size: 42px; background: #141217; border-radius: 5px; }
+#chroma-likeness-wardrobe { padding: 20px; border: 1px solid #87718d; border-radius: 15px; width: min(640px, 94vw); max-height: 88vh; overflow: auto; background: #211f25; color: #f6eff5; font: 14px/1.5 system-ui; color-scheme: dark; }
+#chroma-likeness-wardrobe::backdrop { background: #000a; }
+#chroma-likeness-wardrobe header, #chroma-likeness-wardrobe .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+#chroma-likeness-wardrobe header { justify-content: space-between; margin-bottom: 10px; }
+#chroma-likeness-wardrobe h2 { margin: 0; font: 600 19px system-ui; }
+#chroma-likeness-wardrobe .section { display: grid; gap: 9px; }
+#chroma-likeness-wardrobe label { display: grid; gap: 4px; }
+#chroma-likeness-wardrobe input, #chroma-likeness-wardrobe textarea { box-sizing: border-box; width: 100%; background: #302c33; border: 1px solid #756a78; border-radius: 6px; padding: 6px; color: white; font: inherit; }
+#chroma-likeness-wardrobe button { background: #45354c; color: white; border: 1px solid #8e7896; border-radius: 7px; padding: 5px 10px; cursor: pointer; }
+#chroma-likeness-wardrobe small { color: #d3c2d7; display: block; }
+#chroma-likeness-wardrobe output { background: #312c35; padding: 9px; border-radius: 6px; white-space: pre-wrap; min-height: 1em; }
+#chroma-likeness-wardrobe output:empty { display: none; }
+#chroma-likeness-wardrobe .outfit-ref { width: 100%; max-height: 360px; object-fit: contain; background: #141217; border-radius: 8px; }
+#chroma-likeness-wardrobe .pictures { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
+#chroma-likeness-wardrobe figure { margin: 0; display: grid; gap: 4px; }
+#chroma-likeness-wardrobe figure img { width: 100%; height: 160px; object-fit: contain; background: #141217; border-radius: 5px; }
+#chroma-likeness-wardrobe figure button { padding: 3px 7px; }
+#chroma-likeness-wardrobe .outfit-notes { margin: 0; padding-left: 18px; }
+#chroma-likeness-wardrobe .outfit-notes button { padding: 0 6px; margin-left: 4px; }
+#chroma-likeness-wardrobe [hidden] { display: none !important; }

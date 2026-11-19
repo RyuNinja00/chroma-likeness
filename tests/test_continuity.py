@@ -150,7 +150,7 @@ async def handle(route):
         if url.endswith("/api/v1/jobs/createTask"):
             b = json.loads(req.post_data); schema = SCHEMAS.get(b["model"], {"properties": {"prompt": {}}})
             unknown = [k for k in b["input"] if k not in schema["properties"]]
-            state["inputs"].append({"model": b["model"], "input": {k: (v[:60] if isinstance(v, str) else v) for k, v in b["input"].items()}, "idem": bool(req.headers.get("idempotency-key"))})
+            state["inputs"].append({"model": b["model"], "input": {k: (v[:60] if isinstance(v, str) else v) for k, v in b["input"].items()}, "idem": bool(req.headers.get("idempotency-key")), "full": b["input"].get("prompt", "")})
             if unknown: return await j(route, {"error": {"message": "unknown field " + unknown[0]}}, 400)
             tid = "t%d" % len(state["inputs"]); state["tasks"][tid] = 0
             return await j(route, {"data": {"taskId": tid, "state": "queued"}}, 202)
@@ -173,6 +173,9 @@ async def chat_reply(route, req):
             if isinstance(last, list):
                 text = last[0]["text"]
                 if "What color" in text: reply = '{"color":"red"}'
+                elif "of the outfit" in text:
+                    state["log"].append("OUTFIT VISION two=%s rated=%s" % ("LEFT is the approved picture of the outfit" in text, "POOR" if "POOR" in text else "GOOD"))
+                    reply = json.dumps({"description": "floor-length deep red silk gown, deep V neckline, thigh-high slit on the left leg, thin spaghetti straps, open back, gold strappy heels, gold cuff bracelet, gold drop earrings", "note": "the slit is on the left leg and reaches the thigh"})
                 elif "LEFT is the approved" in text: reply = '{"keys":["hair"]}'
                 else: reply = '<think>x</think>{"face":"round face","eyes":"brown eyes","hair":"ash-brown wolf cut","skin":"fair","build":"slim"}'
             elif "Return JSON only: {\"ok\"" in sysmsg: reply = '{"ok":true,"scene":"apple on a sunny table"}'
@@ -297,11 +300,32 @@ async def main():
         await toasts(page, 7)
         last = state["inputs"][-1]["input"]
         print("5 OUTFIT REFERENCE: images=%d outfit-note=%s" % (len(last.get("image_urls", [])), "Image 2 shows the outfit" in last.get("prompt", "")))
+        # 5c. The Wardrobe: thumbnails, the outfit folder, rating a photo of the outfit
+        await page.click("#chroma-likeness-launch"); await page.wait_for_timeout(1200)
+        await page.evaluate("document.querySelectorAll('#chroma-likeness-panel details').forEach(d => d.open = true)")
+        await page.wait_for_timeout(1500)
+        tiles = page.locator("#chroma-likeness-panel .wardrobe .outfit-tile")
+        print("5c TILES:", await tiles.count(), [await tiles.nth(i).inner_text() for i in range(await tiles.count())][:3], "| thumbnail:", await tiles.first.locator("img").count())
+        await tiles.filter(has_text="Red silk gown").first.click(); await page.wait_for_timeout(1500)
+        box = page.locator("#chroma-likeness-wardrobe")
+        print("5c FOLDER open:", await box.evaluate("d => d.open"), "| photos:", await box.locator("figure").count(), "| ref:", await box.locator("img.outfit-ref").count())
+        await box.locator("figure").first.locator("button", has_text="👎").click(); await page.wait_for_timeout(2500)
+        await page.set_viewport_size({"width": 420, "height": 900}); await page.wait_for_timeout(300); await page.screenshot(path="/tmp/folder.png"); await page.set_viewport_size({"width": 900, "height": 1500})
+        print("5c RATE:", await box.locator("output").inner_text())
+        print("5c LEARNED:", [l for l in state["log"] if l.startswith("OUTFIT VISION")], "| notes:", await box.locator(".outfit-notes li").count(), "| undo:", await box.locator("button", has_text="Undo last change").count())
+        gown = [v for v in closet().values() if v.get("title") == "Red silk gown"][0]
+        print("5c CARD:", gown["outfit"][:50], "| notes:", gown.get("notes"), "| votes:", list(gown.get("votes", {}).values()))
+        await box.locator("button", has_text="Undo last change").click(); await page.wait_for_timeout(1500)
+        print("5c UNDO:", [v for v in closet().values() if v.get("title") == "Red silk gown"][0]["outfit"][:40])
+        await box.locator("button", has_text="Close").first.click(); await page.wait_for_timeout(300)
+        await page.locator("#chroma-likeness-panel button", has_text="Close").first.click(); await page.wait_for_timeout(300)
         # 5b. A side character takes the photo, right after another picture
         state["planner"] = "npc"
         state["msgs"]["c2"] += [{"id": "u43", "role": "user", "content": "We walk out onto the old stone bridge.", "createdAt": now()},
                                 {"id": "n43", "role": "narrator", "content": "Marco, the street photographer, grins and snaps a picture of her as she laughs.", "createdAt": now()}]
         await toasts(page, 8)
+        npc_prompt = state["inputs"][-1]["full"]
+        print("5b LEARNED NOTE IN NEXT PICTURE:", "Get these right: the slit is on the left leg" in npc_prompt, "| images:", len(state["inputs"][-1]["input"].get("image_urls", [])))
         print("5b NPC PHOTO:", [l for l in state["log"] if l.startswith("NPC PLAN")], [l for l in state["log"] if l.startswith("ATTACHED in c2 to n43")])
         # 6. End scene: Marinara clears the link and writes a recap into the Chat; back in the Chat
         state["meta"]["c2"] = {}
