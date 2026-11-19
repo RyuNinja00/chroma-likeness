@@ -71,7 +71,7 @@ async function localStore(table, op, key, value) {
 const serverStore = typeof marinara.storage?.get === "function" && typeof marinara.storage?.patch === "function" ? marinara.storage : null;
 let serverData = null, serverError = "", serverPending = {}, serverTimer = 0;
 function syncedKey(key) {
-  return typeof key === "string" && (["config", "lockedIndex", "links"].includes(key) || /^(state|album|lastScene|link|photos)\//.test(key));
+  return typeof key === "string" && (["config", "lockedIndex", "links"].includes(key) || /^(state|album|lastScene|link|photos|copied)\//.test(key));
 }
 function copyOf(v) {
   return v === undefined || v === null ? v : JSON.parse(JSON.stringify(v));
@@ -1042,6 +1042,7 @@ async function deliver(chat, character, results, pictured, lockFlags = [], conte
     return { path: lock ? imgPath(lock.real.url) : path, id: lock ? lock.real.id : it.id, caption: String((lock ? lock.real.prompt : it.prompt) || "").slice(0, 300), chat, at: Date.now() };
   });
   await addPersonPhotos(pictured, filed).catch(() => {});
+  for (let i = 0; i < results.length; i++) if (results[i]?.model !== "scene photo") await addToCharacterGalleries(pictured, results[i], filed[i]?.path).catch(() => {});
   if (pictured.length === 1 && results[0]?.model !== "scene photo") {
     for (const it of items) {
       const item = await wornItem(chat, pictured[0]).catch(() => null);
@@ -1051,6 +1052,36 @@ async function deliver(chat, character, results, pictured, lockFlags = [], conte
     }
   }
   return items;
+}
+// Every picture also goes into the pictured characters’ own Gallery in Marinara (a friend’s go to the host card).
+// The upload route is tried and confirmed; if Marinara refuses, the status line and one notice say so.
+let charGalleryRoute = "", charGalleryProblem = "", charGalleryWarned = false;
+async function addToCharacterGalleries(ids, result, path = "") {
+  if (config.charGallery === "off" || !result?.blob) return 0;
+  let added = 0;
+  for (const owner of [...new Set(ids.map((id) => String(id).split("~friend~")[0]).filter(Boolean))]) {
+    const done = path ? (await store("settings", "get", "copied/" + owner).catch(() => null)) || [] : [];
+    if (path && done.includes(path)) continue;
+    let ok = false, last = "";
+    for (const route of charGalleryRoute ? [charGalleryRoute] : ["/gallery/upload", "/gallery"]) {
+      const f = new FormData();
+      f.append("file", result.blob, "likeness-" + Date.now().toString(36) + "." + (result.type || "png"));
+      try {
+        const res = await host("/characters/" + enc(owner) + route, "POST", f);
+        if (res && typeof res === "object" && !res.error) { charGalleryRoute = route; ok = true; break; }
+        last = res?.error || "no confirmation";
+      } catch (e) { last = e.message; }
+    }
+    if (!ok) {
+      charGalleryProblem = last;
+      if (!charGalleryWarned) { charGalleryWarned = true; tell("Could not add pictures to the character’s Gallery in Marinara (" + last + "). They are still in the chat Gallery and the Likeness folder."); }
+      return added;
+    }
+    charGalleryProblem = "";
+    added++;
+    if (path) await store("settings", "put", "copied/" + owner, [path, ...done].slice(0, 400));
+  }
+  return added;
 }
 // Every photo Likeness posts is filed with the people in it, for their folders.
 async function addPersonPhotos(ids, photos) {
@@ -1299,6 +1330,44 @@ async function maybeDaily(w, chat = w.chat) {
   await deliver(w.chat, c.id, [result], [c.id], [shouldLock(next?.mood || state.mood)], typeof json.caption === "string" ? json.caption.trim().slice(0, 300) : "");
   note("Sent her " + slot + " photo.");
   return true;
+}
+// ---------- Redo a picture with an edited prompt ----------
+// The new picture takes the old one’s place in its chat message; the old one stays in the Gallery.
+async function redoPicture(row, scene, who) {
+  if (!scene) throw Error("Describe what the picture should show.");
+  const path = imgPath(row.url);
+  const chat = row.chatId || decodeURIComponent(path.split("/")[4]);
+  const cast = chat === chatId && cards.length ? cards : await chatCast(chat);
+  const c = cast.find((x) => x.id === who) || cast.find((x) => x.id === targetFor(row)) || cast.find((x) => !x.owner);
+  if (!c) throw Error("Choose who is pictured first.");
+  const ref = await cardReference(c.id).catch(() => null);
+  const ctx = { ...(await pictureContext(chat, [c])), tags: false };
+  const ratio = row.width && row.height ? (row.width === row.height ? "1:1" : row.width > row.height ? "4:3" : "3:4") : framingFor(null, ctx);
+  const composed = composeScene(scene, "", ctx);
+  const result = await render(ref ? composed : withIdentity(c, ref, composed), ref?.blob, ratio, undefined, undefined, traitsForEdit(ref), null, false, scene,
+    ref ? await outfitPicture(chat, c.id).catch(() => null) : null, ref?.extras?.map((e) => e.blob));
+  const saved = await upload(chat, result);
+  const msgs = await host("/chats/" + enc(chat) + "/messages?limit=100").catch(() => []);
+  const m = msgs.find((x) => (parse(x.extra, {})?.attachments || []).some((a) => imgPath(a.url) === path));
+  let swapped = false;
+  if (m) {
+    const extra = parse(m.extra, {}) || {};
+    const attachments = extra.attachments.map((a) => imgPath(a.url) === path ? { ...a, url: saved.url, galleryId: saved.id, prompt: result.caption } : a);
+    for (const body of [{ ...extra, attachments }, { extra: { ...extra, attachments } }]) {
+      try {
+        await host("/chats/" + enc(chat) + "/messages/" + enc(m.id) + "/extra", "PATCH", body);
+        const now = (await host("/chats/" + enc(chat) + "/messages?limit=100")).find((x) => x.id === m.id);
+        if ((parse(now?.extra, {})?.attachments || []).some((a) => a.url === saved.url)) { swapped = true; break; }
+      } catch {}
+    }
+    if (swapped) refreshChatView(chat);
+  }
+  if (!swapped) await postMedia(chat, c.owner || c.id, [{ ...saved, prompt: result.caption, label: "Redone picture" }], [c.id]);
+  const newPath = imgPath(saved.url);
+  await addPersonPhotos([c.id], [{ path: newPath, id: saved.id, caption: result.caption, chat, at: Date.now() }]).catch(() => {});
+  await addToCharacterGalleries([c.id], result, newPath).catch(() => {});
+  if (panel.open && chat === chatId) refreshRows().catch(() => {});
+  return { row: { ...saved, chatId: chat, prompt: result.submitted }, path: newPath, msg: "Redone" + (swapped ? " and swapped into the chat in place of the old one" : " and posted to the chat") + costText(result) + "." };
 }
 // "Another": the next photo in a series, one step bolder, rendered from the photo you picked so the
 // place, light and outfit carry over; the heart's notes keep the face.
@@ -1684,6 +1753,10 @@ options(ratio, [
 ]);
 const shareSelect = label(settings, "Share hearted looks with Marinara (selfies, Illustrator, Slurp)", node("select"));
 options(shareSelect, [["off", "Off"], ["on", "On · keep each main character's image appearance in sync"]]);
+const photoTextSelect = label(settings, "Chat (Conversation) · a short message from her with each photo (so she remembers what she sent and why)", node("select"));
+options(photoTextSelect, [["on", "On"], ["off", "Off · photo only"]]);
+const charGallerySelect = label(settings, "Also add every picture to the pictured characters’ Gallery in Marinara", node("select"));
+options(charGallerySelect, [["on", "On"], ["off", "Off"]]);
 const negativeInput = label(settings, "Negative prompt · sent to models that accept one; others get a short anatomy line instead", node("textarea"));
 negativeInput.rows = 2;
 negativeInput.placeholder = "Empty sends nothing";
@@ -1741,6 +1814,8 @@ function fillForm() {
   negativeInput.value = config.negative === undefined ? defaultNegative : config.negative;
   dailySelect.value = config.daily || "off";
   shareSelect.value = config.share ? "on" : "off";
+  photoTextSelect.value = config.photoText || "on";
+  charGallerySelect.value = config.charGallery || "on";
   ratio.value = config.ratio || "auto";
   videoSwitch.value = config.videoOn === false ? "off" : "on";
 }
@@ -1779,6 +1854,8 @@ button(controls, "Save settings", async () => {
     ratio: ratio.value,
     videoOn: videoSwitch.value !== "off",
     share: shareSelect.value === "on",
+    photoText: photoTextSelect.value,
+    charGallery: charGallerySelect.value,
     // Before the first automatic setup, only choices you actually made are saved; setup fills the rest.
     models: Object.fromEntries(["gen", "edit", "video"].filter((r) => config.autoConfigured || pickers[r].touched).map((r) => [r, pickers[r].value])),
     textModels: { ...config.textModels, [textProviderSelect.value]: Object.fromEntries(["writer", "vision"].filter((r) => config.autoConfigured || pickers[r].touched).map((r) => [r, pickers[r].value])) },
@@ -1927,6 +2004,7 @@ async function paintArena() {
     "Status: " + watching + " · " + pictures + ".",
     keys + " · " + where + ".",
     link ? "Scene from a Chat: outfits and mood carried over; they go back when the scene ends." : "",
+    charGalleryProblem ? "Character Gallery: Marinara refused the last upload (" + charGalleryProblem + ")." : "",
     last ? "Last reply (" + new Date(last.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) + "): " + last.text : "",
   ].filter(Boolean).join("\n");
 }
@@ -2080,7 +2158,7 @@ async function planPicture(turns,cast,state={outfits:{},mood:null},chat=chatId,f
   const response=await chatCompletion({
     model:modelFor("writer"),max_tokens:1100,temperature:0.3,
     messages:[{role:"system",content:
-      opener + ' Return JSON only: {"pictured":["exact roster id"],"scene":"<picture prompt>","shot":"<shot type>","framing":"portrait|landscape|square","unprompted":false,"continues":false,"dare":false,' + stateContract + ',' + closetContract + '}. ' + closetRule + ' Return {"pictured":[],' + stateContract + '} for no photo, still reporting the mood. If the user just reacted to the last picture wanting more (more, another, keep going, wow, 🔥), set "continues":true and write the next, slightly bolder picture of the same set: same place and light. If the user dares or challenges her to show something, set "dare":true and picture who answers it. The latest exchange is the last user message plus the replies after it; use older turns for context. A request for a photo, someone offering or sending one now, or an active character posing for a natural shared photo are cues. A passing mention, postponed or declined photo, or a request already fulfilled is insufficient.' + initiativeRule + ' Resolve pronouns, relationships and quoted dialogue. The speaker card can voice a friend. Distinguish sender and photographer from the people visible. "Show me your friend" pictures the friend alone. "Both of you" pictures the two people referred to. A friend taking over and sending a selfie pictures herself. When the user’s own character or any other character takes a photo or video of someone, or says they just took one (snaps a picture, films, points a camera, the shutter clicks), picture the people being photographed, from that camera’s point of view; that counts as asked, so "unprompted" is false.' + (photoTaken ? ' A photo is being taken (or was just taken) in the latest exchange: picture what that camera captured, even if the photographer is a minor side character, unless it clearly shows nobody from the roster.' : '') + (force ? ' The user has asked for a picture of this moment: you must choose who is visible and describe it.' : '') + ' Name each visible person in the scene with their current pose, clothes and surroundings. ' + wardrobeRule + ' Do not invent appearance; do not describe face or hair. Choose one or two known people. For uncertain identity, an unknown subject or a larger group, skip the photo.' + styleGuide(ctx) + ' Scene tone: '+heatRule(state.mood)},
+      opener + ' Return JSON only: {"pictured":["exact roster id"],"scene":"<picture prompt>","shot":"<shot type>","framing":"portrait|landscape|square","unprompted":false,"continues":false,"dare":false,"caption":"<one plain sentence: what the photo shows>","why":"<why it is being sent or taken, a few words>","text":"<Conversation chats only: the short message she sends with the photo, in her own voice; empty otherwise>",' + stateContract + ',' + closetContract + '}. ' + closetRule + ' Return {"pictured":[],' + stateContract + '} for no photo, still reporting the mood. If the user just reacted to the last picture wanting more (more, another, keep going, wow, 🔥), set "continues":true and write the next, slightly bolder picture of the same set: same place and light. If the user dares or challenges her to show something, set "dare":true and picture who answers it. The latest exchange is the last user message plus the replies after it; use older turns for context. A request for a photo, someone offering or sending one now, or an active character posing for a natural shared photo are cues. A passing mention, postponed or declined photo, or a request already fulfilled is insufficient.' + initiativeRule + ' Resolve pronouns, relationships and quoted dialogue. The speaker card can voice a friend. Distinguish sender and photographer from the people visible. "Show me your friend" pictures the friend alone. "Both of you" pictures the two people referred to. A friend taking over and sending a selfie pictures herself. When the user’s own character or any other character takes a photo or video of someone, or says they just took one (snaps a picture, films, points a camera, the shutter clicks), picture the people being photographed, from that camera’s point of view; that counts as asked, so "unprompted" is false.' + (photoTaken ? ' A photo is being taken (or was just taken) in the latest exchange: picture what that camera captured, even if the photographer is a minor side character, unless it clearly shows nobody from the roster.' : '') + (force ? ' The user has asked for a picture of this moment: you must choose who is visible and describe it.' : '') + ' Name each visible person in the scene with their current pose, clothes and surroundings. ' + wardrobeRule + ' Do not invent appearance; do not describe face or hair. Choose one or two known people. For uncertain identity, an unknown subject or a larger group, skip the photo.' + styleGuide(ctx) + ' Scene tone: '+heatRule(state.mood)},
     {role:"user",content:JSON.stringify({localTime:localTime(),roster,conversation})}]
   });
   let plan=replyJson(response,"pictured");
@@ -2089,7 +2167,7 @@ async function planPicture(turns,cast,state={outfits:{},mood:null},chat=chatId,f
     const retry=await chatCompletion({
       model:modelFor("writer"),max_tokens:2000,temperature:0.2,
       messages:[
-        {role:"system",content:'You turn a decision into JSON. Return one JSON object and nothing else, no story text, no commentary: {"pictured":["exact roster id"],"scene":"<picture prompt>","shot":"<shot type>","framing":"portrait|landscape|square","unprompted":false,"continues":false,"dare":false,' + stateContract + ',' + closetContract + '}. ' + closetRule + ' Use {"pictured":[]} for no picture. Roster: ' + JSON.stringify(roster)},
+        {role:"system",content:'You turn a decision into JSON. Return one JSON object and nothing else, no story text, no commentary: {"pictured":["exact roster id"],"scene":"<picture prompt>","shot":"<shot type>","framing":"portrait|landscape|square","unprompted":false,"continues":false,"dare":false,"caption":"<one plain sentence: what the photo shows>","why":"<why it is being sent or taken, a few words>","text":"<Conversation chats only: the short message she sends with the photo, in her own voice; empty otherwise>",' + stateContract + ',' + closetContract + '}. ' + closetRule + ' Use {"pictured":[]} for no picture. Roster: ' + JSON.stringify(roster)},
         {role:"user",content:JSON.stringify({latest:conversation.slice(-3),earlierAnswer:replyText(response).slice(0,3000)})}
       ]
     }).catch(()=>null);
@@ -2199,11 +2277,14 @@ async function pollContext(w, chat = chat, force = false) {
   const scene=refs[0] ? styled : [first.name,first.appearance,styled].filter(Boolean).join(". ");
   // A saved outfit with a picture of it: that picture shows the edit model the clothes.
   const outfitRef=!second && refs[0] ? await outfitPicture(chat, first.id) : null;
-  const rendered=await render(scene,refs[0]?.blob,framingFor(plan.raw,ctx),undefined,undefined,traitsForEdit(refs[0]),pair,false,plan.scene,outfitRef,second ? [] : refs[0]?.extras?.map((e)=>e.blob));
+  // What the photo shows and why travels with it, so the character knows what was sent.
+  const photoNote=[typeof plan.raw?.caption==="string" ? plan.raw.caption.trim() : "", typeof plan.raw?.why==="string" && plan.raw.why.trim() ? "why: "+plan.raw.why.trim() : ""].filter(Boolean).join(" — ").slice(0,380);
+  const say=ctx.arena==="conversation" && config.photoText!=="off" && typeof plan.raw?.text==="string" ? plan.raw.text.trim().slice(0,300) : "";
+  const rendered=await render(scene,refs[0]?.blob,framingFor(plan.raw,ctx),undefined,undefined,traitsForEdit(refs[0]),pair,false,photoNote || plan.scene,outfitRef,second ? [] : refs[0]?.extras?.map((e)=>e.blob));
   if (!await stillCurrent()) { await upload(chat,rendered); setStatus(chat, "The chat moved on before the picture was ready; it is in the Gallery."); return; }
   const ids=plan.people.map(c=>c.id);
   const locked=shouldLock(next?.mood || state.mood);
-  await deliver(chat,latest.characterId || first.owner || first.id,[rendered],ids,[locked]);
+  await deliver(chat,latest.characterId || first.owner || first.id,[rendered],ids,[locked],say);
   setStatus(chat, (photoTaken ? "Pictured the photo taken in the story: " : "Picture posted: ") + plan.people.map(c=>c.name).join(" + ") + (rendered.refsSent ? " · " + rendered.refsSent + " reference picture" + (rendered.refsSent === 1 ? "" : "s") + " sent" : "") + ".");
   await store("settings","put","lastScene/"+chat+"/"+ids.slice().sort().join("|"),plan.scene);
   tell((plan.unprompted&&!userAsked?(ctx.arena==="conversation"?"She sent a photo on her own: ":"Illustrated a story beat: "):"Picture posted: ")+plan.people.map(c=>c.name).join(" + ")+(locked?" (locked).":"."));
@@ -2752,6 +2833,22 @@ async function autoShare(id) {
 }
 const shareControls = node("div", undefined, "actions");
 gallery.append(shareControls);
+button(shareControls, "Add this character’s photos to their Marinara Gallery", async () => {
+  const id = characterSelect.value;
+  if (!id) throw Error("Choose a character first.");
+  if (config.charGallery === "off") throw Error("Adding to character galleries is switched off in Settings.");
+  const filed = (await store("settings", "get", "photos/" + id)) || [];
+  const here = rows.filter((r) => targetFor(r) === id || (!targetFor(r) && r.provider === own)).map((r) => imgPath(r.url));
+  let added = 0;
+  for (const path of [...new Set([...filed.map((x) => x.path), ...here])].filter(Boolean)) {
+    const blob = await getPicture(path).catch(() => null);
+    if (!blob) continue;
+    added += await addToCharacterGalleries([id], { blob, type: (blob.type.split("/")[1] || "png").replace("jpg", "jpeg") }, path);
+    if (charGalleryProblem) break;
+  }
+  if (charGalleryProblem) throw Error("Marinara refused the upload: " + charGalleryProblem);
+  note(added ? "Added " + added + " picture" + (added === 1 ? "" : "s") + " to the character’s Gallery in Marinara (ones already added are skipped)." : "Nothing new to add: those photos are already in the character’s Gallery.");
+});
 button(shareControls, "Share look with Marinara & Slurp", async () => {
   const id = characterSelect.value;
   if (!id) throw Error("Choose a character first.");
@@ -2867,6 +2964,41 @@ async function openPerson(id) {
   if (!outfitBox.open) outfitBox.showModal();
 }
 outfitBox.addEventListener("close", () => { openedPerson = ""; openedOutfit = null; });
+async function openRedo(row, who = "") {
+  openedOutfit = null;
+  let current = row;
+  const head = node("header"), close = node("button", "Close");
+  close.type = "button";
+  close.onclick = () => outfitBox.close();
+  head.append(node("h2", "Redo this picture"), close);
+  if (openedPerson) {
+    const back = node("button", "← " + (cards.find((c) => c.id === openedPerson)?.name || "Back"));
+    back.type = "button";
+    back.onclick = () => action(() => openPerson(openedPerson));
+    head.prepend(back);
+  }
+  const body = node("div", undefined, "section");
+  const img = node("img", undefined, "outfit-ref");
+  img.src = imgPath(row.url);
+  img.alt = "Picture to redo";
+  body.append(img);
+  const text = label(body, "What the picture should show · edit it, then Redo", node("textarea"));
+  text.rows = 6;
+  text.value = cleanCaption(row.prompt) || "";
+  const actions = node("div", undefined, "actions");
+  outfitButton(actions, "↻ Redo (1 paid image)", async () => {
+    const done = await redoPicture(current, text.value.trim(), who);
+    current = done.row;
+    img.src = done.path;
+    return done.msg;
+  });
+  body.append(actions, node("small", "Uses the hearted references and the outfit she is wearing. The new picture takes the old one’s place in the chat; the old one stays in the Gallery."));
+  mirrorOut = outfitOut;
+  outfitOut.textContent = "";
+  body.append(outfitOut);
+  outfitBox.replaceChildren(head, body);
+  if (!outfitBox.open) outfitBox.showModal();
+}
 function openPanel() {
   if (!panel.open) panel.showModal();
 }
@@ -3295,11 +3427,7 @@ async function paint() {
       item.append(detail);
     }
     if (r.prompt)
-      button(item, "✎", async () => {
-        prompt.value = r.prompt;
-        draftShot = "";
-        note("Prompt copied to Generate a picture for editing.");
-      }).title = "Copy this prompt to Generate a picture";
+      button(item, "✎", () => openRedo(r, who)).title = "Redo with an edited prompt";
     // Buttons sit in one compact row under the picture; the prompt details go last.
     const bar = node("div", undefined, "actions");
     bar.append(...item.querySelectorAll(":scope > button"));
@@ -3520,7 +3648,7 @@ function toastResult(message){
   feedbackToast.textContent=message;feedbackToast.hidden=false;
   marinara.clearTimeout(toastTimer);toastTimer=marinara.setTimeout(()=>feedbackToast.hidden=true,4800);
 }
-for(const [op,caption,title] of [["heart","♡","Use as reference"],["up","👍","Good likeness"],["down","👎","Poor likeness"],["fav","★","Add to album"],["more","📸","Another, a little bolder"],["animate","🎬","Animate this photo"],["unlock","🔓","Unlock this photo"]]){
+for(const [op,caption,title] of [["heart","♡","Use as reference"],["up","👍","Good likeness"],["down","👎","Poor likeness"],["fav","★","Add to album"],["more","📸","Another, a little bolder"],["animate","🎬","Animate this photo"],["redo","✎","Redo with an edited prompt"],["unlock","🔓","Unlock this photo"]]){
   const b=node("button",caption);b.type="button";b.title=title;b.dataset.op=op;b.setAttribute("aria-label",title);inline.append(b);
   b.onclick=()=>{const path=targetImage;hide();action(async()=>{
     try{
@@ -3538,6 +3666,7 @@ for(const [op,caption,title] of [["heart","♡","Use as reference"],["up","👍"
         toastResult("Making the next shot…");
         await anotherShot(row,cid||known||"");toastResult(lastNote);return;
       }
+      if(op==="redo"){openPanel();await openRedo(row,cid||known||"");return;}
       if(op==="animate"){
         toastResult("Animating… this can take a few minutes.");
         const c=cards.find(x=>x.id===(cid||known))||cards.find(x=>!x.owner);

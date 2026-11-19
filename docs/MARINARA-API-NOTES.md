@@ -15,6 +15,7 @@ Send the headers `x-marinara-csrf: 1` and `X-Admin-Secret` (taken from localStor
 | `PATCH /api/chats/:chatId/messages/:messageId/extra` | Adds pictures to an existing message (Roleplay). The extension sends the whole merged `extra` object, then the `{extra}` form if that doesn't work, and reads the message back to confirm |
 | `PATCH /api/chats/:chatId/messages/:messageId` | Edits content only |
 | `GET /api/connections`, `GET /api/connections/:id/models` | Fills the model dropdowns |
+| `POST /api/characters/:id/gallery/upload` (fallback `/gallery`) | Adds a picture to the character's own Gallery (FormData `file`). The route isn't documented; the extension tries both and reports a refusal. Known related routes: `GET /api/characters/:id/gallery/file/:filename`, `POST /api/characters/:id/gallery/bake` (web URLs only, refuses local addresses) |
 | `GET/PATCH /api/characters/:id` | Card data. PATCH takes `{data:{extensions}, skipVersionSnapshot, versionSource}`; it deep-merges, and `null` deletes |
 | `GET /api/gallery/:chatId`, `POST /api/gallery/:chatId/upload` | Gallery. Upload is FormData with provider, model, prompt and file. The extension's rows have provider `chroma-likeness` |
 | `GET /api/gallery/file/:chat/:file` | Image files |

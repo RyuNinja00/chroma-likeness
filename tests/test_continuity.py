@@ -81,6 +81,9 @@ async def handle(route):
         if path == "/connections": return await j(route, [
             {"id": "s1", "name": "SpicyAPI images", "provider": "image_generation", "model": "bytedance/seedream-5.0-pro/edit", "baseUrl": "https://api.spicyapi.ai/api/v1"},
             {"id": "n1", "name": "NanoGPT chat", "provider": "nanogpt", "model": "deepseek/x", "baseUrl": "https://nano-gpt.com/api/v1"}])
+        if path == "/characters/ch1/gallery/upload" and req.method == "POST":
+            state["log"].append("CHAR GALLERY upload")
+            return await j(route, {"id": "cg%d" % len(state["log"]), "filename": "x.png"})
         if path == "/characters/ch1":
             if req.method == "PATCH":
                 body = json.loads(req.post_data); merge(state["char"], body["data"]); state["log"].append("PATCH card " + ",".join(body["data"].get("extensions", {}).keys()))
@@ -208,7 +211,8 @@ async def chat_reply(route, req):
                          "beat": {"pictured": ["ch1"], "scene": "Alex stepping onto the moonlit dock of the lake house", "shot": "wide", "unprompted": True},
                          "wear": {"pictured": ["ch1"], "scene": "Alex turning by the fire to show off the gown", "shot": "full body", "wear": {"Alex": "red silk gown"}},
                          "again": {"pictured": ["ch1"], "scene": "Alex leaning on the balcony rail", "shot": "medium"},
-                         "quiet": {"pictured": []}}.get(mode)
+                         "quiet": {"pictured": []},
+                         "selfie": {"pictured": ["ch1"], "scene": "Alex mirror selfie in the red silk gown", "shot": "mirror selfie", "caption": "Alex in the red silk gown in her bedroom mirror", "why": "you asked to see the dress on her", "text": "Here it is on 😘 what do you think?"}}.get(mode)
                 if mode == "npc":
                     taken, insist = "A photo is being taken" in sysmsg, "you must choose who is visible" in sysmsg
                     state["log"].append("NPC PLAN taken-rule=%s insist=%s" % (taken, insist))
@@ -282,6 +286,15 @@ async def main():
                                 {"id": "a31", "role": "assistant", "characterId": "ch1", "content": "Done, it's yours to see again whenever you like.", "createdAt": now()}]
         print("3 WARDROBE toasts:", await toasts(page, 5))
         print("3 CLOSET:", [(v.get("title"), len(v["outfit"]), v.get("auto")) for v in closet().values()])
+        # 3b. A photo asked for in Chat arrives with her message, and its description and reason
+        state["planner"] = "selfie"
+        state["msgs"]["c1"] += [{"id": "u32", "role": "user", "content": "Send me a pic of you wearing it?", "createdAt": now()},
+                                {"id": "a32", "role": "assistant", "characterId": "ch1", "content": "One sec, changing into it now...", "createdAt": now()}]
+        await toasts(page, 6)
+        post = [m for m in state["msgs"]["c1"] if m["id"].startswith("p")][-1]
+        ex = json.loads(post["extra"])
+        print("3b CHAT PHOTO: message text =", repr(post["content"]), "| photo note =", ex["attachments"][0].get("prompt"))
+        print("3b CHARACTER GALLERY uploads so far:", len([l for l in state["log"] if l == "CHAR GALLERY upload"]))
         # 4. Marinara builds a scene from the Chat: a new Roleplay chat linked to c1, opened with a fresh reply
         state["meta"]["c2"] = {"sceneOriginChatId": "c1", "sceneStatus": "active"}
         state["msgs"]["c2"] += [{"id": "n40", "role": "narrator", "content": "The lake house glows as you both arrive; she steps onto the dock.", "createdAt": now()}]
@@ -322,6 +335,21 @@ async def main():
         await box.locator("button", has_text="Undo last change").click(); await page.wait_for_timeout(1500)
         print("5c UNDO:", [v for v in closet().values() if v.get("title") == "Red silk gown"][0]["outfit"][:40])
         await box.locator("button", has_text="Close").first.click(); await page.wait_for_timeout(300)
+        await page.locator("#chroma-likeness-panel button", has_text="Close").first.click(); await page.wait_for_timeout(300)
+        # 5d. Redo a picture with an edited prompt; it replaces the old one in its message
+        await page.click("#chroma-likeness-launch"); await page.wait_for_timeout(1200)
+        await page.locator("#chroma-likeness-panel .person-tile").first.click(); await page.wait_for_timeout(2000)
+        n_att = len([l for l in state["log"] if l.startswith("ATTACHED")])
+        await box.locator("article button", has_text="✎").first.click(); await page.wait_for_timeout(800)
+        print("5d REDO view:", await box.locator("h2").inner_text(), "| prompt:", (await box.locator("textarea").input_value())[:60])
+        await box.locator("textarea").fill("Alex laughing on the balcony, wind in the red silk gown")
+        await box.locator("button", has_text="Redo").click(); await page.wait_for_timeout(4000)
+        print("5d REDO:", await box.locator("output").inner_text(), "|", [l for l in state["log"] if l.startswith("ATTACHED")][n_att:][:1])
+        await box.locator("button", has_text="← Alex").click(); await page.wait_for_timeout(1500)
+        before = len([l for l in state["log"] if l == "CHAR GALLERY upload"])
+        await box.locator("button", has_text="Add this character").click(); await page.wait_for_timeout(4000)
+        print("5d COPY TO GALLERY:", await box.locator("output").inner_text(), "| new uploads:", len([l for l in state["log"] if l == "CHAR GALLERY upload"]) - before)
+        await box.locator("header button", has_text="Close").first.click(); await page.wait_for_timeout(300)
         await page.locator("#chroma-likeness-panel button", has_text="Close").first.click(); await page.wait_for_timeout(300)
         # 5b. A side character takes the photo, right after another picture
         state["planner"] = "npc"
