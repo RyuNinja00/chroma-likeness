@@ -22,7 +22,7 @@ You are picking up **Chroma Likeness**, a Marinara Engine personal extension. Re
   - `render()`: generates or edits a picture via `spicyImage()`.
   - `deliver()` → `postMedia()`: puts the picture in the gallery, then into the chat. In Roleplay the picture is attached to the latest message via PATCH `/extra`; in Conversation it's posted as a separate message. Then `refreshChatView()`.
   - `poll()` → `linkChats()` (scene ↔ Chat links, `checkReturns()` after End scene) → `pollContext()` → `planPicture()`: the writer decides who to picture and how, and returns JSON read by `replyJson()`. That JSON includes outfits, mood, `wardrobeAdd` and `wear`, which `absorbState()` applies.
-  - Picture rules: Conversation uses `config.initiative`; Roleplay and Game use `config.story` (moments/often/photos/off). `setStatus()` records why each reply did or didn't get a picture, for the status line in `paintArena()`.
+  - Picture rules: a photo taken in the story (`takesPhoto()` on the user's last message and the latest reply) is always pictured unless story pictures are off, with one insisting retry. Conversation uses `config.initiative`; Roleplay and Game use `config.story` (moments/often/photos/off). `setStatus()` records why each reply did or didn't get a picture, for the status line in `paintArena()`.
   - Closet items: `{outfit, title?, auto, picture?, at}`. Saved (`auto:false`) items are never pruned. `picture` is passed to `render()` as `outfitRef` (image 2, clothes only).
   - `animatePicture()`, `makeSet()`, `maybeDaily()`, the closet, the album, dares and locked photos.
 - Chat type comes from `chatArena(id)` (`conversation` | `roleplay` | `game`) and controls style through `styleFor()`, `styleGuide()` and `composeScene()`.

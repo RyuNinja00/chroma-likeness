@@ -1847,6 +1847,23 @@ button(smart,"Preview who would be pictured (1 text call)",async()=>{
 });
 let lastContextTurn;
 const lastTurns = new Map();
+// Someone in the story takes (or just took) a photo or video: "he snaps a picture of her", "I took a
+// photo", "the shutter clicks", "she raises her phone". Negated mentions ("don’t take a picture") are ignored.
+const photoActions = [
+  /\b(?:take|takes|took|taking|taken|snap|snaps|snapped|snapping|grab|grabs|grabbed|capture|captures|captured|capturing|shoot|shoots|shot|film|films|filmed|filming|record|records|recorded|recording|get|gets|got|getting)\b[^.!?\n]{0,40}?\b(?:photos?|pictures?|pics?|selfies?|snapshots?|photographs?|videos?|clips?|polaroids?)\b/gi,
+  /\b(?:photographs|photographed|photographing|snapshots? of)\b/gi,
+  /\b(?:shutter|camera)\s+(?:clicks?|clicked|snaps?|snapped|fires?|fired|whirs?|flashes|flashed)\b/gi,
+  /\bflash\s+(?:goes off|went off|fires|fired|pops|popped|bursts|burst)\b/gi,
+  /\b(?:points?|pointed|raises?|raised|lifts?|lifted|aims?|aimed|holds? up|held up)\s+(?:his|her|my|their|the|a|your)\s+(?:phone|camera)\b/gi,
+];
+const photoNegation = /\b(?:don['’]?t|do not|doesn['’]?t|does not|didn['’]?t|did not|never|no|won['’]?t|will not|can['’]?t|cannot|stop|without|refuses? to|instead of)\b[^.!?\n]{0,25}$/i;
+function takesPhoto(text) {
+  const t = String(text || "");
+  for (const re of photoActions) {
+    for (const m of t.matchAll(re)) if (!photoNegation.test(t.slice(Math.max(0, m.index - 40), m.index))) return true;
+  }
+  return false;
+}
 const photoWords = /\b(photo|picture|pic|pics|selfie|snap|snaps|snapped|shot|camera|film|filming|record|polaroid|nudes?)\b|📸|📷/i;
 // Contextual results reach you even with the panel closed.
 function tell(message) {
@@ -1863,7 +1880,7 @@ function recentTurns(id) {
     (m.role==="user" || isReply(m)) && (m.content?.trim() || parse(m.extra,{})?.attachments?.length))
     .sort((a,b)=>String(a.createdAt||"").localeCompare(String(b.createdAt||""))));
 }
-async function planPicture(turns,cast,state={outfits:{},mood:null},chat=chatId,force=false) {
+async function planPicture(turns,cast,state={outfits:{},mood:null},chat=chatId,force=false,photoTaken=false) {
   if (!turns.length || !cast.length) return null;
   const ctx = await pictureContext(chat, cast.filter((c) => !c.owner).slice(0, 1));
   const wardrobes = await Promise.all(cast.map((c) => readCloset(c.id).catch(() => [])));
@@ -1887,7 +1904,7 @@ async function planPicture(turns,cast,state={outfits:{},mood:null},chat=chatId,f
   const response=await chatCompletion({
     model:modelFor("writer"),max_tokens:1100,temperature:0.3,
     messages:[{role:"system",content:
-      opener + ' Return JSON only: {"pictured":["exact roster id"],"scene":"<picture prompt>","shot":"<shot type>","framing":"portrait|landscape|square","unprompted":false,"continues":false,"dare":false,' + stateContract + ',' + closetContract + '}. ' + closetRule + ' Return {"pictured":[],' + stateContract + '} for no photo, still reporting the mood. If the user just reacted to the last picture wanting more (more, another, keep going, wow, 🔥), set "continues":true and write the next, slightly bolder picture of the same set: same place and light. If the user dares or challenges her to show something, set "dare":true and picture who answers it. The latest exchange is the last user message plus the replies after it; use older turns for context. A request for a photo, someone offering or sending one now, or an active character posing for a natural shared photo are cues. A passing mention, postponed or declined photo, or a request already fulfilled is insufficient.' + initiativeRule + ' Resolve pronouns, relationships and quoted dialogue. The speaker card can voice a friend. Distinguish sender and photographer from the people visible. "Show me your friend" pictures the friend alone. "Both of you" pictures the two people referred to. A friend taking over and sending a selfie pictures herself. When the user’s own character takes a photo of someone (snaps a picture, films, points a camera), picture the people being photographed, from that camera’s point of view; that counts as asked, so "unprompted" is false.' + (force ? ' The user has asked for a picture of this moment: you must choose who is visible and describe it.' : '') + ' Name each visible person in the scene with their current pose, clothes and surroundings. ' + wardrobeRule + ' Do not invent appearance; do not describe face or hair. Choose one or two known people. For uncertain identity, an unknown subject or a larger group, skip the photo.' + styleGuide(ctx) + ' Scene tone: '+heatRule(state.mood)},
+      opener + ' Return JSON only: {"pictured":["exact roster id"],"scene":"<picture prompt>","shot":"<shot type>","framing":"portrait|landscape|square","unprompted":false,"continues":false,"dare":false,' + stateContract + ',' + closetContract + '}. ' + closetRule + ' Return {"pictured":[],' + stateContract + '} for no photo, still reporting the mood. If the user just reacted to the last picture wanting more (more, another, keep going, wow, 🔥), set "continues":true and write the next, slightly bolder picture of the same set: same place and light. If the user dares or challenges her to show something, set "dare":true and picture who answers it. The latest exchange is the last user message plus the replies after it; use older turns for context. A request for a photo, someone offering or sending one now, or an active character posing for a natural shared photo are cues. A passing mention, postponed or declined photo, or a request already fulfilled is insufficient.' + initiativeRule + ' Resolve pronouns, relationships and quoted dialogue. The speaker card can voice a friend. Distinguish sender and photographer from the people visible. "Show me your friend" pictures the friend alone. "Both of you" pictures the two people referred to. A friend taking over and sending a selfie pictures herself. When the user’s own character or any other character takes a photo or video of someone, or says they just took one (snaps a picture, films, points a camera, the shutter clicks), picture the people being photographed, from that camera’s point of view; that counts as asked, so "unprompted" is false.' + (photoTaken ? ' A photo is being taken (or was just taken) in the latest exchange: picture what that camera captured, even if the photographer is a minor side character, unless it clearly shows nobody from the roster.' : '') + (force ? ' The user has asked for a picture of this moment: you must choose who is visible and describe it.' : '') + ' Name each visible person in the scene with their current pose, clothes and surroundings. ' + wardrobeRule + ' Do not invent appearance; do not describe face or hair. Choose one or two known people. For uncertain identity, an unknown subject or a larger group, skip the photo.' + styleGuide(ctx) + ' Scene tone: '+heatRule(state.mood)},
     {role:"user",content:JSON.stringify({localTime:localTime(),roster,conversation})}]
   });
   let plan=replyJson(response,"pictured");
@@ -1949,21 +1966,25 @@ async function pollContext(w, chat = chat, force = false) {
   // Did the user's own last message ask for, or take, a picture? Then it is never "unasked".
   const lastUser=[...turns].reverse().find((t)=>t.role==="user");
   const userAsked=lastUser && turns.indexOf(lastUser)>=turns.length-3 && photoWords.test(String(lastUser.content||""));
+  // A photo taken in the story, by you or anyone else, in your last message or the reply.
+  const photoTaken=takesPhoto(latest.content) || Boolean(lastUser && turns.indexOf(lastUser)>=turns.length-3 && takesPhoto(lastUser.content));
   const roster=await chatCast(chat);
   const state=await sceneState(chat);
-  const plan=await planPicture(turns,roster,state,chat,force);
+  let plan=await planPicture(turns,roster,state,chat,force,photoTaken);
+  // A photo was taken but the writer pictured nobody: ask once more, this time insisting.
+  if (plan && photoTaken && !force && !plan.people.length && plan.raw!==null && alive) plan=await planPicture(turns,roster,state,chat,true,true);
   if (!plan || (!force && watch!==w) || !alive) return;
   // Mood, outfits and wardrobe requests are tracked on every checked reply, photo or not.
   const next=await absorbState(chat,roster,plan.raw);
   const story=(await chatArena(chat))!=="conversation";
   const level=story ? (config.story || "moments") : (config.initiative || "off");
   if (!plan.people.length) {
-    setStatus(chat, plan.raw===null ? "No picture: the writing model’s answer could not be read." : story && level==="photos" ? "No picture: nobody took a photo in that reply." : "No picture: the writer saw nothing to picture.");
+    setStatus(chat, plan.raw===null ? "No picture: the writing model’s answer could not be read." : photoTaken ? "No picture: a photo was taken, but the writer could not tell who it shows." : story && level==="photos" ? "No picture: nobody took a photo in that reply." : "No picture: the writer saw nothing to picture.");
     if (force || userAsked) tell(force ? "The writer could not tell who is in the picture. Choose the character and use Generate and post instead." : "Likeness decided not to picture that reply. Open ♡ Likeness → Contextual photos → 📷 Picture the last reply to make one anyway.");
     return;
   }
   if (story && level==="off" && !userAsked && !force) { setStatus(chat, "No picture: Roleplay and Game pictures are off in Settings."); return; }
-  if (plan.unprompted && !plan.continues && !plan.dare && !userAsked && !force) {
+  if (plan.unprompted && !plan.continues && !plan.dare && !userAsked && !photoTaken && !force) {
     const gap = { often: story ? 2 : 3, moments: 3, sometimes: 6 }[level];
     const since = repliesSincePicture(turns);
     if (!gap || since < gap) { setStatus(chat, !gap ? "No picture: nobody asked for one and pictures on her own are off." : "No picture yet: the last one was " + since + " replies ago (at least " + gap + " between pictures nobody asked for)."); return; }
@@ -2008,7 +2029,7 @@ async function pollContext(w, chat = chat, force = false) {
   const locked=shouldLock(next?.mood || state.mood);
   const sent=await deliver(chat,latest.characterId || first.owner || first.id,[rendered],ids,[locked]);
   if (!second && wearing) rememberOutfitPicture(first.id, wearing, sent[0]).catch(() => {});
-  setStatus(chat, "Picture posted: " + plan.people.map(c=>c.name).join(" + ") + (locked ? " (locked)." : "."));
+  setStatus(chat, (photoTaken ? "Pictured the photo taken in the story: " : "Picture posted: ") + plan.people.map(c=>c.name).join(" + ") + (locked ? " (locked)." : "."));
   await store("settings","put","lastScene/"+chat+"/"+ids.slice().sort().join("|"),plan.scene);
   tell((plan.unprompted&&!userAsked?(ctx.arena==="conversation"?"She sent a photo on her own: ":"Illustrated a story beat: "):"Picture posted: ")+plan.people.map(c=>c.name).join(" + ")+(locked?" (locked).":"."));
   if (panel.open && chatId===chat) refreshRows().catch(()=>{});

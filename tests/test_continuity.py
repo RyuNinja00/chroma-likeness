@@ -206,6 +206,10 @@ async def chat_reply(route, req):
                          "wear": {"pictured": ["ch1"], "scene": "Alex turning by the fire to show off the gown", "shot": "full body", "wear": {"Alex": "red silk gown"}},
                          "again": {"pictured": ["ch1"], "scene": "Alex leaning on the balcony rail", "shot": "medium"},
                          "quiet": {"pictured": []}}.get(mode)
+                if mode == "npc":
+                    taken, insist = "A photo is being taken" in sysmsg, "you must choose who is visible" in sysmsg
+                    state["log"].append("NPC PLAN taken-rule=%s insist=%s" % (taken, insist))
+                    extra = {"pictured": ["ch1"], "scene": "Alex mid-laugh on the bridge, caught by Marco's camera", "shot": "candid phone photo", "unprompted": True} if insist else {"pictured": []}
                 if extra is not None:
                     return await j(route, {"choices": [{"message": {"content": json.dumps({**extra, "mood": {"level": 6, "note": "warm"}})}}]})
                 if mode == "nobody":
@@ -293,6 +297,12 @@ async def main():
         await toasts(page, 7)
         last = state["inputs"][-1]["input"]
         print("5 OUTFIT REFERENCE: images=%d outfit-note=%s" % (len(last.get("image_urls", [])), "Image 2 shows the outfit" in last.get("prompt", "")))
+        # 5b. A side character takes the photo, right after another picture
+        state["planner"] = "npc"
+        state["msgs"]["c2"] += [{"id": "u43", "role": "user", "content": "We walk out onto the old stone bridge.", "createdAt": now()},
+                                {"id": "n43", "role": "narrator", "content": "Marco, the street photographer, grins and snaps a picture of her as she laughs.", "createdAt": now()}]
+        await toasts(page, 8)
+        print("5b NPC PHOTO:", [l for l in state["log"] if l.startswith("NPC PLAN")], [l for l in state["log"] if l.startswith("ATTACHED in c2 to n43")])
         # 6. End scene: Marinara clears the link and writes a recap into the Chat; back in the Chat
         state["meta"]["c2"] = {}
         state["msgs"]["c1"] += [{"id": "r50", "role": "system", "content": "Scene recap: an evening at the lake house.", "extra": json.dumps({"sceneChatId": "c2"}), "createdAt": now()}]
