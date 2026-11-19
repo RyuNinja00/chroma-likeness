@@ -71,7 +71,7 @@ async function localStore(table, op, key, value) {
 const serverStore = typeof marinara.storage?.get === "function" && typeof marinara.storage?.patch === "function" ? marinara.storage : null;
 let serverData = null, serverError = "", serverPending = {}, serverTimer = 0;
 function syncedKey(key) {
-  return typeof key === "string" && (["config", "lockedIndex", "links"].includes(key) || /^(state|album|lastScene|link)\//.test(key));
+  return typeof key === "string" && (["config", "lockedIndex", "links"].includes(key) || /^(state|album|lastScene|link|photos)\//.test(key));
 }
 function copyOf(v) {
   return v === undefined || v === null ? v : JSON.parse(JSON.stringify(v));
@@ -944,8 +944,9 @@ const lockModes = [
   ["spicy", "Lock spicy photos · mood 7/10 and up"],
   ["all", "Lock every photo"],
 ];
-function shouldLock(mood) {
-  return config.lock === "all" || (config.lock === "spicy" && (mood?.level ?? 0) >= 7);
+// Locked photos were retired in 2.8.0: nothing new is locked. Photos sent locked earlier can still be unlocked.
+function shouldLock() {
+  return false;
 }
 let lockedIndex = null;
 async function lockedEntries() {
@@ -992,6 +993,11 @@ async function deliver(chat, character, results, pictured, lockFlags = [], conte
     await store("settings", "put", "lockedIndex", index);
   }
   await postMedia(chat, character, items, pictured, lockFlags.some(Boolean) ? { likenessLocked: true } : {}, content);
+  const filed = items.map((it) => {
+    const path = imgPath(it.url), lock = index[path];
+    return { path: lock ? imgPath(lock.real.url) : path, id: lock ? lock.real.id : it.id, caption: String((lock ? lock.real.prompt : it.prompt) || "").slice(0, 300), chat, at: Date.now() };
+  });
+  await addPersonPhotos(pictured, filed).catch(() => {});
   if (pictured.length === 1 && results[0]?.model !== "scene photo") {
     for (const it of items) {
       const item = await wornItem(chat, pictured[0]).catch(() => null);
@@ -1001,6 +1007,14 @@ async function deliver(chat, character, results, pictured, lockFlags = [], conte
     }
   }
   return items;
+}
+// Every photo Likeness posts is filed with the people in it, for their folders.
+async function addPersonPhotos(ids, photos) {
+  for (const id of ids) {
+    const list = (await store("settings", "get", "photos/" + id)) || [];
+    const fresh = photos.filter((x) => x.path && !list.some((y) => y.path === x.path));
+    if (fresh.length) await store("settings", "put", "photos/" + id, [...fresh, ...list].slice(0, 80));
+  }
 }
 async function unlockPhoto(path) {
   const index = await lockedEntries(), entry = index[path];
@@ -1367,7 +1381,9 @@ async function postMedia(id, character, items, pictured, extra = {}, content = "
   });
   refreshChatView(id);
 }
+let mirrorOut = null;
 function note(s) {
+  if (mirrorOut?.isConnected) mirrorOut.textContent = s;
   lastNote = s;
   output.textContent = s;
 }
@@ -1609,6 +1625,7 @@ const storySelect = label(settings, "Roleplay and Game · pictures of the story"
 options(storySelect, storyLevels);
 const lockSelect = label(settings, "Locked photos · arrive blurred until you tap 🔓", node("select"));
 options(lockSelect, lockModes);
+lockSelect.parentElement.hidden = true;
 const dareSelect = label(settings, "Dares in chat (contextual mode) · answered with a 3-photo set", node("select"));
 options(dareSelect, [["on", "On"], ["off", "Off"]]);
 const dailySelect = label(settings, "Morning and night photos (Conversation chats with contextual photos on)", node("select"));
@@ -2334,7 +2351,7 @@ button(create, "Send dare (1 text call + 3 paid images)", async () => {
 });
 // ---------- Wardrobe: a thumbnail per outfit, and a folder for each ----------
 const wardrobeSection = section("Wardrobe");
-wardrobeSection.append(node("small", "Outfits of the character chosen under Generate a picture. The thumbnail is the outfit’s reference picture (♡ in its folder changes it). Tap an outfit to see its photos, rate them, and edit what it learned."));
+wardrobeSection.append(node("small", "The thumbnail is each outfit’s reference picture. Tap an outfit to see its photos, rate them, and edit what it learned."));
 const wardrobeGrid = node("div", undefined, "pictures wardrobe");
 wardrobeSection.append(wardrobeGrid);
 function tally(votes, dir) {
@@ -2410,6 +2427,12 @@ async function paintOutfit() {
   close.type = "button";
   close.onclick = () => outfitBox.close();
   head.append(node("h2", (who?.name ? who.name + " · " : "") + (item?.title || "Outfit")), close);
+  if (openedPerson) {
+    const back = node("button", "← " + (cards.find((c) => c.id === openedPerson)?.name || "Back"));
+    back.type = "button";
+    back.onclick = () => action(() => openPerson(openedPerson));
+    head.prepend(back);
+  }
   if (!item) { outfitBox.replaceChildren(head, node("p", "That outfit is no longer in the wardrobe.")); return; }
   const body = node("div", undefined, "section");
   if (item.picture) {
@@ -2630,7 +2653,7 @@ selectedPreview.style.cssText =
   "max-height:150px;max-width:200px;object-fit:contain";
 gallery.append(selectedPreview);
 gallery.append(node("small","The reference picture, appearance notes and likeness ratings travel in Marinara character card exports."));
-const traitsInput = label(gallery, "Fixed appearance in the hearted photo", node("textarea"));
+const traitsInput = label(gallery, "Appearance · from the hearted photo, used in every picture (likeness ratings refine it)", node("textarea"));
 traitsInput.maxLength = 450;
 traitsInput.placeholder = "Face shape, hair color and cut, distinguishing features, build";
 button(gallery, "Save appearance notes", async () => {
@@ -2648,7 +2671,7 @@ button(galleryControls, "Refresh", async () => {
   await loadLists(chatId);
   note("Gallery refreshed.");
 });
-button(galleryControls, "Clear selected character’s heart", async () => {
+button(galleryControls, "Clear heart and learning", async () => {
   if (!characterSelect.value) throw Error("Choose a character first.");
   await saveProfile(characterSelect.value, {version:1, anchor:null, learning:null, ratings:null});
   await paint();
@@ -2734,6 +2757,68 @@ function showClip(blob, message) {
 }
 const grid = node("div", undefined, "pictures");
 gallery.append(grid);
+// ---------- Characters: a thumbnail per character, and a folder for each ----------
+// Everything about one character lives in their folder: the hearted reference, appearance, sharing,
+// outfits, favourites and all their photos. The panel keeps only the thumbnails.
+const personPane = node("div", undefined, "section");
+{
+  const moved = [...gallery.childNodes].filter((n) => n !== clipShelf && n !== grid);
+  const wardrobeNodes = [...wardrobeSection.childNodes], albumNodes = [...albumBox.childNodes];
+  personPane.append(...moved, node("h3", "Outfits"), ...wardrobeNodes, node("h3", "Favourites"), ...albumNodes,
+    node("h3", "Photos"), node("small", "Pictures of this character in the selected chat, plus Likeness pictures of them from other chats. ♡ makes one the hearted reference; 👍/👎 rate the likeness."), clipShelf, grid);
+  wardrobeSection.parentElement.remove();
+  albumBox.parentElement.remove();
+  gallery.parentElement.querySelector("summary").textContent = "Characters";
+}
+const characterGrid = node("div", undefined, "pictures wardrobe");
+gallery.append(node("small", "Tap a character to open their folder: hearted reference, appearance, outfits, favourites and every photo."), characterGrid);
+button(gallery, "Refresh", async () => { await loadLists(chatId); note("Refreshed."); });
+let tileUrls = [], openedPerson = "";
+async function paintCharacters() {
+  const tiles = [];
+  for (const c of cards) {
+    const ref = await cardReference(c.id).catch(() => null);
+    const tile = node("button", undefined, "outfit-tile person-tile");
+    tile.type = "button";
+    if (ref?.blob) {
+      const u = URL.createObjectURL(ref.blob);
+      tiles.urls = [...(tiles.urls || []), u];
+      const img = node("img");
+      img.src = u;
+      img.alt = c.name;
+      tile.append(img);
+    } else tile.append(node("span", "👤", "outfit-empty"));
+    const outfits = (await readCloset(c.id).catch(() => [])).length;
+    tile.append(node("strong", c.name + (c.owner ? " · friend" : "")),
+      node("small", [ref ? "♥ hearted" : "no heart yet", ref ? Object.keys(ref.votes || {}).length + " rated" : "", outfits ? outfits + " outfits" : ""].filter(Boolean).join(" · ")));
+    tile.onclick = () => action(() => openPerson(c.id));
+    tiles.push(tile);
+  }
+  for (const u of tileUrls) URL.revokeObjectURL(u);
+  tileUrls = tiles.urls || [];
+  characterGrid.replaceChildren(...(tiles.length ? tiles : [node("small", "Select a chat with characters.")]));
+}
+async function openPerson(id) {
+  openedPerson = id;
+  openedOutfit = null;
+  if (characterSelect.value !== id) {
+    characterSelect.value = id;
+    prompt.value = ""; draftShot = ""; draftFraming = ""; companion.value = "";
+    refreshCompanions();
+    await paintState();
+  }
+  const c = cards.find((x) => x.id === id);
+  const head = node("header"), close = node("button", "Close");
+  close.type = "button";
+  close.onclick = () => outfitBox.close();
+  head.append(node("h2", (c?.name || "Character") + (c?.owner ? " · friend" : "")), close);
+  mirrorOut = outfitOut;
+  outfitOut.textContent = "";
+  outfitBox.replaceChildren(head, outfitOut, personPane);
+  await paint();
+  if (!outfitBox.open) outfitBox.showModal();
+}
+outfitBox.addEventListener("close", () => { openedPerson = ""; openedOutfit = null; });
 function openPanel() {
   if (!panel.open) panel.showModal();
 }
@@ -3062,8 +3147,14 @@ async function paint() {
     : "No heart selected for this character.";
   grid.replaceChildren();
   paintAlbum().catch(() => {});
+  paintCharacters().catch(() => {});
   const locked = await lockedEntries();
-  for (const r of rows.slice(0, 80)) {
+  const who = characterSelect.value;
+  const filed = who ? (await store("settings", "get", "photos/" + who).catch(() => null)) || [] : [];
+  const shown = rows.filter((r) => !who || !targetFor(r) || targetFor(r) === who);
+  const elsewhere = filed.filter((x) => !shown.some((r) => imgPath(r.url) === x.path))
+    .map((x) => ({ id: x.id, url: x.path, chatId: x.chat, provider: own, model: "from another chat", prompt: x.caption }));
+  for (const r of [...shown, ...elsewhere].slice(0, 80)) {
     const path = imgPath(r.url), item = node("article");
     const isVideo = /\.(mp4|webm|mov)$/i.test(path) || /video/i.test(String(r.type || r.mediaType || ""));
     if (isVideo) {
@@ -3087,11 +3178,7 @@ async function paint() {
       continue;
     }
     item.append(node("small", (r.provider === own ? "Likeness · " : "Marinara · ") + (r.model || "Image")));
-    button(
-      item,
-      ref?.url === path ? "♥ Selected" : "♡ Use likeness",
-      () => heart(r),
-    );
+    button(item, ref?.url === path ? "♥" : "♡", () => heart(r)).title = ref?.url === path ? "The hearted reference" : "Use as the hearted reference";
     if(ref && ref.url!==path) for(const [dir,label] of [["up","👍"],["down","👎"]]){
       const b=button(item,label,async()=>{await rate(r,dir);await paint();});
       b.title=dir==="up"?"Good likeness":"Poor likeness";
@@ -3099,21 +3186,21 @@ async function paint() {
     }
     if (characterSelect.value) {
       const faved = (await albumOf(characterSelect.value)).some((f) => f.path === path);
-      button(item, faved ? "★ In album" : "☆ Favourite", async () => {
+      button(item, faved ? "★" : "☆", async () => {
         const added = await toggleFavourite(characterSelect.value, r);
         await paint();
         note(added ? "Added to the album." : "Removed from the album.");
-      });
+      }).title = faved ? "In favourites (tap to remove)" : "Add to favourites";
     }
     {
-      const b = button(item, "📸 Another", async () => {
+      const b = button(item, "📸", async () => {
         await anotherShot(r, characterSelect.value);
         await refreshRows();
       });
       b.title = "The next, slightly bolder shot from this one (1 text call + 1 paid image call)";
     }
     if (videoEnabled()) {
-      const b = button(item, "🎬 Animate", async () => {
+      const b = button(item, "🎬", async () => {
         const c = cards.find((x) => x.id === characterSelect.value);
         await animatePicture(r, c ? c.owner || c.id : "");
         await refreshRows();
@@ -3129,12 +3216,15 @@ async function paint() {
       item.append(detail);
     }
     if (r.prompt)
-      button(item, "Use prompt", async () => {
+      button(item, "✎", async () => {
         prompt.value = r.prompt;
         draftShot = "";
-        prompt.focus();
-        note("Gallery prompt copied for editing.");
-      });
+        note("Prompt copied to Generate a picture for editing.");
+      }).title = "Copy this prompt to Generate a picture";
+    // Buttons sit in one compact row under the picture; the prompt details go last.
+    const bar = node("div", undefined, "actions");
+    bar.append(...item.querySelectorAll(":scope > button"));
+    item.insertBefore(bar, item.querySelector(":scope > details"));
     grid.append(item);
   }
 }
