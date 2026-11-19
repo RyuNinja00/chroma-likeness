@@ -150,3 +150,4 @@
 #chroma-likeness-wardrobe .outfit-notes { margin: 0; padding-left: 18px; }
 #chroma-likeness-wardrobe .outfit-notes button { padding: 0 6px; margin-left: 4px; }
 #chroma-likeness-wardrobe [hidden] { display: none !important; }
+#chroma-likeness-wardrobe .outfit-warn { color: #ffcf8a; }

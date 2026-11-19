@@ -667,10 +667,15 @@ const adultAnchor = "All people shown are adults.";
 function withoutSelfieNote(text) {
   return text.replace(/\[(?:[^\[\]\n]{1,100} sent|sent) a selfie(?:\s*:[^\]\n]*)?\]/gi, "").trim();
 }
+const hairWear = /\b(?:clips?|pins?|barrettes?|scrunchies?|ribbons?|bows?|headbands?|hair ?bands?|hair ?ties?|combs?|tiaras?|crowns?|flowers?|veils?|nets?|wraps?|scarf|scarves|bandanas?|hats?|beads?|jewel(?:s|ry|led)?|ornaments?|accessor(?:y|ies))\b/i;
+const identityWords = /\b(?:blond(?:e)?|brunette|redhead|freckles?|beauty marks?|birthmarks?|babyface|wolf[ -]?cut|bangs|hairstyle|haircut|button nose|(?:round|oval|square|heart-shaped) face|(?:blue|green|hazel|brown|doe) eyes)\b/gi;
 function referenceEditPrompt(scene, traits) {
   const identity = /\b(?:blond(?:e)?|brunette|redhead|freckles?|beauty marks?|birthmarks?|babyface|wolf[ -]?cut|bangs|hair(?:style|cut)?|button nose|(?:round|oval|square|heart-shaped) face|(?:blue|green|hazel|brown|doe) eyes)\b/i;
   const changes = withoutSelfieNote(scene).replace(/\b(?:her |his |their )?hair (?:tied|pulled|pinned) (back|up)\b/gi, "wearing a tied-$1 style").split(/(?:[,.!?;\n]+|\s+[—–]\s+)/)
-    .map(part => part.trim()).filter(part => part && !identity.test(part)).join(". ");
+    .map(part => part.trim())
+    // Things worn in the hair (clip, ribbon, tiara…) are clothing: keep them, minus any colour or haircut words.
+    .map(part => identity.test(part) && hairWear.test(part) ? part.replace(identityWords, "").replace(/\s{2,}/g, " ").trim() : part)
+    .filter(part => part && (!identity.test(part) || hairWear.test(part))).join(". ");
   return [
     "Edit the supplied reference photo. Keep the same person: face shape and proportions, nose, eyes, skin details, hair color, haircut and body type. Keep permanent markings. Follow the current scene for expression, clothing, removable jewelry, accessories, lighting and surroundings, even if the reference shows something different.",
     traits && "Reference appearance: " + traits + ".",
@@ -692,6 +697,14 @@ async function render(prompt, reference, ratio, token = undefined, model = saved
     throw Error(model + " accepts only one reference picture, so it cannot render two saved people together.");
   const sizes = { "3:4": [896, 1152], "1:1": [1024, 1024], "4:3": [1152, 896] };
   const [width, height] = sizes[ratio] || sizes["3:4"];
+  // Saved outfits with a reference picture go in after the people, for the clothes only.
+  const room = meta?.maxInputs || 0;
+  const extras = raw || !reference ? [] : pair
+    ? (room ? (pair.outfits || []).map((o, i) => o?.blob ? { ...o, who: i ? pair.second : pair.first } : null).filter(Boolean).slice(0, Math.max(0, room - 2)) : [])
+    : outfitRef?.blob && (!room || room >= 2) ? [outfitRef] : [];
+  const firstExtra = pair ? 3 : 2;
+  const outfitNote = extras.map((o, i) => "Image " + (firstExtra + i) + " shows the outfit" + (o.who ? " for " + o.who : "") + " (" + o.title + "): copy only its clothing, shoes and accessories" +
+    (o.who ? " onto " + o.who : "") + "; faces, hair and builds come from " + (pair ? "images 1 and 2" : "image 1") + "." + (o.notes?.length ? " Get these right: " + o.notes.slice(0, 4).join("; ") + "." : "")).join(" ");
   let submitted = pair ? [
     "Create one natural photograph of two distinct people. Image 1 is " + pair.first + "; image 2 is " + pair.second + ". Keep each person's face, build and hair attached to that person.",
     traits && pair.first + ": " + traits, pair.traits && pair.second + ": " + pair.traits,
@@ -699,26 +712,40 @@ async function render(prompt, reference, ratio, token = undefined, model = saved
   ].filter(Boolean).join("\n") : reference && !raw
     ? referenceEditPrompt(clean, traits)
     : clean;
-  // A picture of a saved outfit goes in as image 2, for the clothes only.
-  const outfitBlob = outfitRef?.blob && reference && !pair && !raw && (!meta?.maxInputs || meta.maxInputs >= 2) ? outfitRef.blob : null;
-  const outfitNote = outfitBlob ? "Image 2 shows the outfit (" + outfitRef.title + "): copy only its clothing, shoes and accessories; the person’s face, hair and build come from image 1." +
-    (outfitRef.notes?.length ? " Get these right: " + outfitRef.notes.slice(0, 4).join("; ") + "." : "") : "";
   if (outfitNote) submitted = outfitNote + "\n" + submitted;
   const tagged = !reference && !pair && wantsTags(model);
   if (!raw) submitted = (tagged ? "adults only, " : adultAnchor + " ") + submitted;
   const limit = meta?.maxPrompt || (reference ? 3000 : 4000);
   if (submitted.length > limit) {
-    // Trim appearance notes before the scene: the reference pixels already carry identity.
+    // Too long: keep the instructions, the outfit-picture notes and the likeness details that ratings taught
+    // whole; shorten the scene (where long outfit descriptions sit) first, then the general appearance notes.
     const instruction = pair
       ? "Image 1 is " + pair.first + "; image 2 is " + pair.second + ". Keep both likenesses distinct."
       : reference ? "Keep the reference person's face, hair and build." : "";
-    const scene = [raw ? "" : adultAnchor, instruction, outfitNote, "Scene: " + withoutSelfieNote(clean)].filter(Boolean).join(" ");
-    const notes = pair ? [traits, pair.traits] : reference ? [traits] : [];
-    const budget = notes.length ? Math.max(0, Math.floor((limit - scene.length) / notes.length) - 2) : 0;
-    submitted = [scene, ...notes.map((t) => (t || "").slice(0, budget))].filter(Boolean).join(" ");
+    const head = [raw ? "" : adultAnchor, instruction, outfitNote].filter(Boolean).join(" ");
+    const names = pair ? [pair.first, pair.second] : [""];
+    const parts = (pair ? [traits, pair.traits] : reference ? [traits] : []).map((t) => {
+      t = t || "";
+      const at = t.indexOf("Match these details");
+      return at < 0 ? { base: t, focus: "" } : { base: t.slice(0, at).replace(/[.\s]+$/, ""), focus: t.slice(at) };
+    });
+    const focus = parts.map((x, i) => x.focus && (names[i] ? names[i] + ": " : "") + x.focus).filter(Boolean).join(" ");
+    let sceneText = withoutSelfieNote(clean);
+    const build = () => [head, "Scene: " + sceneText, ...parts.map((x, i) => x.base && x.cut ? (names[i] ? names[i] + ": " : "") + x.cut : ""), focus].filter(Boolean).join(" ");
+    const fixed = head.length + focus.length + 12;
+    const sceneRoom = Math.max(300, Math.floor((limit - fixed) * 0.7));
+    if (sceneText.length > sceneRoom) sceneText = sceneText.slice(0, sceneRoom).replace(/\s+\S*$/, "") + "…";
+    const withBase = parts.filter((x) => x.base).length;
+    const each = withBase ? Math.floor((limit - fixed - sceneText.length - 30 * withBase) / withBase) : 0;
+    for (const x of parts) x.cut = each > 40 ? x.base.slice(0, each) : "";
+    submitted = build();
+    if (submitted.length > limit) {
+      sceneText = sceneText.slice(0, Math.max(120, sceneText.length - (submitted.length - limit) - 2));
+      submitted = build();
+    }
   }
   if (submitted.length > limit) throw Error("Shorten the scene to fit the " + limit + "-character prompt limit of " + model + ".");
-  const { blob, cost } = await spicyImage(submitted, model, ratio, width, height, reference ? (pair ? [reference, pair.blob] : outfitBlob ? [reference, outfitBlob] : [reference]) : [], token);
+  const { blob, cost } = await spicyImage(submitted, model, ratio, width, height, reference ? [reference, ...(pair ? [pair.blob] : []), ...extras.map((o) => o.blob)] : [], token);
   const head = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
   const type =
     head[0] === 137 && head[1] === 80 ? "png"
@@ -1089,11 +1116,28 @@ async function addOutfitPicture(id, item, path) {
   if (!path || item.pictures?.includes(path)) return;
   await writeCloset(id, { [item.key]: { pictures: [path, ...(item.pictures || [])].slice(0, 24), ...(item.picture ? {} : { picture: path }) } });
 }
+// The outfit's reference picture. One you chose with ♡ is kept. Otherwise the extension picks: a photo
+// rated 👍 for her likeness first, never one rated 👎 for likeness or for the outfit (a drifted face in
+// the outfit picture can pull new pictures off-likeness). The pick is saved, so the thumbnail follows it.
+async function outfitReference(id, item, likes) {
+  if (item.pictureChosen && item.picture) return item.picture;
+  likes ??= (await cardReference(id).catch(() => null))?.votes || {};
+  const like = (p) => likes[p]?.direction;
+  const ok = (p) => p && like(p) !== "down" && item.votes?.[p] !== "down";
+  const pics = [...new Set([item.picture, ...(item.pictures || [])].filter(Boolean))];
+  const pick = pics.find((p) => ok(p) && like(p) === "up") || (ok(item.picture) ? item.picture : pics.find(ok)) || "";
+  if (pick !== (item.picture || "")) {
+    await writeCloset(id, { [item.key]: { picture: pick || null } }).catch(() => {});
+    item.picture = pick || undefined;
+  }
+  return pick;
+}
 // The outfit's reference picture (and what feedback taught it), for the edit model.
 async function outfitPicture(chat, id) {
   const item = await wornItem(chat, id).catch(() => null);
-  if (!item?.picture) return null;
-  const blob = await getPicture(item.picture).catch(() => null);
+  const path = item && (await outfitReference(id, item).catch(() => item.picture));
+  if (!path) return null;
+  const blob = await getPicture(path).catch(() => null);
   return blob ? { blob, title: item.title || "the saved outfit", notes: item.notes || [] } : null;
 }
 // 👍/👎 on a photo of an outfit: the vision model compares it with the outfit's reference picture and
@@ -2086,7 +2130,8 @@ async function pollContext(w, chat = chat, force = false) {
     if (panel.open && chatId===chat) refreshRows().catch(()=>{});
     return;
   }
-  const pair=second ? {first:first.name,second:second.name,blob:refs[1].blob,traits:traitsForEdit(refs[1])} : null;
+  const pair=second ? {first:first.name,second:second.name,blob:refs[1].blob,traits:traitsForEdit(refs[1]),
+    outfits:[await outfitPicture(chat, first.id), await outfitPicture(chat, second.id)]} : null;
   const ctx={...plan.ctx,tags:plan.ctx.tags && !refs[0]};
   const styled=composeScene(plan.scene,plan.shot,ctx);
   const scene=refs[0] ? styled : [first.name,first.appearance,styled].filter(Boolean).join(". ");
@@ -2299,6 +2344,8 @@ async function paintWardrobe() {
   const id = characterSelect.value;
   if (!id) { wardrobeGrid.replaceChildren(node("small", "Choose a character under Generate a picture.")); return; }
   const items = (await readCloset(id).catch(() => [])).sort((a, b) => (a.auto - b.auto) || (b.at || 0) - (a.at || 0));
+  const likes = (await cardReference(id).catch(() => null))?.votes || {};
+  for (const i of items) await outfitReference(id, i, likes).catch(() => {});
   const worn = chatId ? await wornItem(chatId, id).catch(() => null) : null;
   wardrobeGrid.replaceChildren(...(items.length ? items.map((i) => {
     const tile = node("button", undefined, "outfit-tile");
@@ -2356,6 +2403,8 @@ async function paintOutfit() {
   const { id, key } = openedOutfit;
   const item = (await readCloset(id).catch(() => [])).find((i) => i.key === key);
   const who = cards.find((c) => c.id === id);
+  const likes = (await cardReference(id).catch(() => null))?.votes || {};
+  if (item) await outfitReference(id, item, likes).catch(() => {});
   const head = node("header");
   const close = node("button", "Close");
   close.type = "button";
@@ -2367,7 +2416,8 @@ async function paintOutfit() {
     const ref = node("img", undefined, "outfit-ref");
     ref.src = item.picture;
     ref.alt = "Reference picture";
-    body.append(ref, node("small", "Reference picture · shows the clothes to the edit model, and is the wardrobe thumbnail."));
+    body.append(ref, node("small", "Reference picture · shows the clothes to the edit model, and is the wardrobe thumbnail" + (item.pictureChosen ? " (chosen by you)." : " (picked automatically: photos rated 👍 for her likeness come first).")));
+    if (likes[item.picture]?.direction === "down") body.append(node("small", "⚠ You rated this picture 👎 for her likeness. Its face can pull new pictures off-likeness: pick another photo with ♡.", "outfit-warn"));
   } else body.append(node("small", "No reference picture yet: the first photo of this outfit, or the first you mark 👍 or ♡, becomes it."));
   const title = label(body, "Name", node("input"));
   title.value = item.title || "";
@@ -2426,18 +2476,20 @@ async function paintOutfit() {
     img.loading = "lazy";
     const row = node("div", undefined, "actions");
     const vote = item.votes?.[path];
+    const likeVote = likes[path]?.direction;
     outfitButton(row, item.picture === path ? "♥" : "♡", async () => {
-      await writeCloset(id, { [key]: { picture: path } });
-      return "This photo now shows the clothes in new pictures, and is the wardrobe thumbnail.";
+      await writeCloset(id, { [key]: { picture: path, pictureChosen: true } });
+      return "This photo now shows the clothes in new pictures, and is the wardrobe thumbnail." + (likeVote === "down" ? " Note: you rated it 👎 for her likeness." : "");
     }, "Use as the outfit’s reference picture");
     outfitButton(row, vote === "up" ? "👍✓" : "👍", () => rateOutfit(id, key, path, "up"), "Shows the outfit right");
     outfitButton(row, vote === "down" ? "👎✓" : "👎", () => rateOutfit(id, key, path, "down"), "Gets the outfit wrong");
     outfitButton(row, "✕", async () => {
       const rest = (item.pictures || []).filter((x) => x !== path);
-      await writeCloset(id, { [key]: { pictures: rest, votes: { [path]: null }, ...(item.picture === path ? { picture: rest[0] || null } : {}) } });
+      await writeCloset(id, { [key]: { pictures: rest, votes: { [path]: null }, ...(item.picture === path ? { picture: rest[0] || null, pictureChosen: null } : {}) } });
       return "Removed from this outfit (it stays in the Gallery).";
     }, "Remove from this outfit");
     fig.append(img, row);
+    if (likeVote) fig.append(node("small", "Likeness " + (likeVote === "up" ? "👍" : "👎")));
     photos.append(fig);
   }
   body.append(node("small", (item.pictures?.length ? item.pictures.length + " photos of this outfit · rate how well each shows the clothes" : "No photos of this outfit yet: Picture her in it, or have her wear it in a chat.")), photos);
