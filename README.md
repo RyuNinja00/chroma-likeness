@@ -4,12 +4,12 @@ A personal extension for [Marinara Engine](https://github.com/Pasta-Devs/Marinar
 
 Pictures and video come from **SpicyAPI**. Text work (deciding when to take a photo, writing the picture prompt, describing the hearted picture) runs on **NanoGPT** or a SpicyAPI text model.
 
-Current version: **2.8.0**. See [docs/PROJECT-HISTORY.md](docs/PROJECT-HISTORY.md) for every change and the reasons behind it.
+Current version: **2.9.0**. See [docs/PROJECT-HISTORY.md](docs/PROJECT-HISTORY.md) for every change and the reasons behind it.
 
 ## What it does
 
 - **Does every picture itself:** Marinara's Illustrator can stay off in Chat and Roleplay. Contextual photos start on their own in whichever chat is open.
-- **Likeness:** a hearted reference per character, stored on the character card, plus a short written description of how they look. 👍/👎 ratings add notes that guide later edits.
+- **Likeness:** a main hearted reference per character plus up to 2 extra hearts (other angles), stored on the character card, with a short written description of how they look. Each picture sends only as many reference pictures as the editing model takes; the limit is shown under the editing model in Settings and in each character's folder. 👍/👎 ratings add notes that guide later edits.
 - **Context photos:** watches the open chat. In Chat (Conversation) it pictures photos you ask for or she sends, and optionally some on her own. In Roleplay and Game it pictures key story moments by default (configurable), including the first reply of a new scene, and always pictures a photo taken in the story, whether you or another character takes it. The style adapts: phone-camera realism in Conversation, scene shots in Roleplay.
 - **Continuity:** remembers each character's current outfit and mood for each chat. When Marinara builds a scene from a Chat, the outfit and mood carry into the scene. After End scene they come back, with a photo from the scene posted in the Chat.
 - **Wardrobe:** "add this to your wardrobe" saves a named, detailed outfit on the character card. "Put on the red dress" wears it. Each outfit has a reference picture (its thumbnail), a folder of its photos, and 👍/👎 feedback that rewrites its description and keeps corrections for later pictures. Outfits are shown inside each character's folder.
@@ -20,7 +20,7 @@ Current version: **2.8.0**. See [docs/PROJECT-HISTORY.md](docs/PROJECT-HISTORY.m
 
 ## Install
 
-1. In Marinara, go to Settings → Addons → Personal Extensions and import `releases/Chroma-Likeness-Marinara-2.8.0.zip`. If you're building from source, run `scripts/package.sh` first and import the ZIP it makes.
+1. In Marinara, go to Settings → Addons → Personal Extensions and import `releases/Chroma-Likeness-Marinara-2.9.0.zip`. If you're building from source, run `scripts/package.sh` first and import the ZIP it makes.
 2. Approve it. Marinara asks again after every change to the extension.
 3. Reload the browser tab. The Marinara server doesn't need restarting.
 4. Open the Likeness panel, add your SpicyAPI and NanoGPT keys, and press **Auto-configure**. Turn Illustrator off in your chats; Likeness makes the pictures.

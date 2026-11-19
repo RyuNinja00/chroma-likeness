@@ -464,6 +464,36 @@ function negativePrompt() {
   return config.negative === undefined ? defaultNegative : String(config.negative).trim();
 }
 // Build createTask input from the model's own schema: SpicyAPI rejects any field the schema does not list.
+// How many reference pictures the editing model takes, from its own input rules on SpicyAPI.
+// When the model does not say, play safe: 2 for a list of pictures, 1 for a single picture field.
+// Before its rules are loaded, only what is known for sure (else 1).
+function refCapacity(model) {
+  const meta = catalog.meta.get(model) || {};
+  const props = catalog.schemas.get(model)?.properties || {}, names = Object.keys(props);
+  const many = names.find((n) => props[n]?.type === "array" && /image|ref/i.test(n) && !/mask/i.test(n));
+  const one = names.find((n) => props[n]?.type === "string" && /image|ref|frame/i.test(n) && !/mask|format|size|resolution|ratio|last|end|tail/i.test(n));
+  if (many) {
+    const stated = props[many].maxItems || meta.maxInputs;
+    return { max: stated || 2, stated: Boolean(stated) };
+  }
+  if (one) return { max: 1, stated: true };
+  if (names.length) return { max: 0, stated: true };
+  if (meta.maxInputs) return { max: meta.maxInputs, stated: true };
+  return { max: meta.edit === false ? 0 : 1, stated: false };
+}
+// What goes into a picture of one person: the main heart, then 1 extra heart, the outfit picture, a 2nd extra heart.
+function soloPlan(max) {
+  const left = max - 1;
+  return { hearts: (left >= 1 ? 1 : 0) + (left >= 3 ? 1 : 0), outfit: left >= 2 };
+}
+function capacityText(model) {
+  const { max, stated } = refCapacity(model);
+  if (max < 1) return "⚠ takes no reference pictures, so hearted pictures cannot be used";
+  const plan = soloPlan(max);
+  const alone = ["main heart", plan.hearts ? plan.hearts + " extra heart" + (plan.hearts > 1 ? "s" : "") : "", plan.outfit ? "outfit picture" : ""].filter(Boolean).join(" + ");
+  return (stated ? "takes up to " + max + " reference picture" + (max > 1 ? "s" : "") : "does not say how many reference pictures it takes, so Likeness sends at most " + max + " to be safe") +
+    " · sent for one person: " + alone + " · two people: " + (max >= 2 ? "each main heart" + (max >= 3 ? " + outfit pictures as room allows" : "") : "not possible with this model");
+}
 function buildInput(model, schema, { prompt, refs, ratio, width, height }) {
   const isVideo = !!catalog.meta.get(model)?.video;
   const props = schema?.properties || {}, names = Object.keys(props);
@@ -685,7 +715,7 @@ function referenceEditPrompt(scene, traits) {
 function costText(result) {
   return typeof result?.cost === "number" ? " ($" + result.cost.toFixed(4) + ")" : "";
 }
-async function render(prompt, reference, ratio, token = undefined, model = savedModel(Boolean(reference)), traits = "", pair = null, raw = false, caption = "", outfitRef = null) {
+async function render(prompt, reference, ratio, token = undefined, model = savedModel(Boolean(reference)), traits = "", pair = null, raw = false, caption = "", outfitRef = null, heartExtras = []) {
   token ??= imageKey();
   if (!model) throw Error("Choose a SpicyAPI image model in Settings and save it.");
   const clean = prompt.trim();
@@ -693,16 +723,28 @@ async function render(prompt, reference, ratio, token = undefined, model = saved
   const meta = modelMeta(model);
   if (reference && meta?.edit === false)
     throw Error(model + " makes new pictures only. Choose a reference editing model in Settings.");
-  if (pair && meta?.maxInputs && meta.maxInputs < 2)
-    throw Error(model + " accepts only one reference picture, so it cannot render two saved people together.");
+  // Never send more pictures than the model takes (see refCapacity and the note under the editing model).
+  if (reference) await modelSchema(model).catch(() => null);
+  const cap = reference ? refCapacity(model).max : 0;
+  if (reference && cap < 1) throw Error(model + " does not take reference pictures. Choose an editing model in Settings.");
+  if (pair && cap < 2)
+    throw Error(model + " takes only one reference picture, so it cannot picture two saved people together.");
   const sizes = { "3:4": [896, 1152], "1:1": [1024, 1024], "4:3": [1152, 896] };
   const [width, height] = sizes[ratio] || sizes["3:4"];
-  // Saved outfits with a reference picture go in after the people, for the clothes only.
-  const room = meta?.maxInputs || 0;
-  const extras = raw || !reference ? [] : pair
-    ? (room ? (pair.outfits || []).map((o, i) => o?.blob ? { ...o, who: i ? pair.second : pair.first } : null).filter(Boolean).slice(0, Math.max(0, room - 2)) : [])
-    : outfitRef?.blob && (!room || room >= 2) ? [outfitRef] : [];
-  const firstExtra = pair ? 3 : 2;
+  // Fill the room the model has: one person gets the main heart, then 1 extra heart, the outfit picture and a
+  // 2nd extra heart; two people get both main hearts, then their outfit pictures.
+  let left = cap - (pair ? 2 : 1);
+  const moreHearts = [], extras = [];
+  if (reference && !raw && !pair) {
+    const hearts = (heartExtras || []).filter(Boolean);
+    if (hearts[0] && left > 0) { moreHearts.push(hearts[0]); left--; }
+    if (outfitRef?.blob && left > 0) { extras.push(outfitRef); left--; }
+    if (hearts[1] && left > 0) { moreHearts.push(hearts[1]); left--; }
+  } else if (reference && !raw && pair) {
+    for (const [i, o] of (pair.outfits || []).entries()) if (o?.blob && left > 0) { extras.push({ ...o, who: i ? pair.second : pair.first }); left--; }
+  }
+  const firstExtra = (pair ? 3 : 2) + moreHearts.length;
+  const heartNote = moreHearts.length ? "Images 1 to " + (1 + moreHearts.length) + " all show the same person from different angles: use them together for her face, hair and build, and edit image 1." : "";
   const outfitNote = extras.map((o, i) => "Image " + (firstExtra + i) + " shows the outfit" + (o.who ? " for " + o.who : "") + " (" + o.title + "): copy only its clothing, shoes and accessories" +
     (o.who ? " onto " + o.who : "") + "; faces, hair and builds come from " + (pair ? "images 1 and 2" : "image 1") + "." + (o.notes?.length ? " Get these right: " + o.notes.slice(0, 4).join("; ") + "." : "")).join(" ");
   let submitted = pair ? [
@@ -713,6 +755,7 @@ async function render(prompt, reference, ratio, token = undefined, model = saved
     ? referenceEditPrompt(clean, traits)
     : clean;
   if (outfitNote) submitted = outfitNote + "\n" + submitted;
+  if (heartNote) submitted = heartNote + "\n" + submitted;
   const tagged = !reference && !pair && wantsTags(model);
   if (!raw) submitted = (tagged ? "adults only, " : adultAnchor + " ") + submitted;
   const limit = meta?.maxPrompt || (reference ? 3000 : 4000);
@@ -722,7 +765,7 @@ async function render(prompt, reference, ratio, token = undefined, model = saved
     const instruction = pair
       ? "Image 1 is " + pair.first + "; image 2 is " + pair.second + ". Keep both likenesses distinct."
       : reference ? "Keep the reference person's face, hair and build." : "";
-    const head = [raw ? "" : adultAnchor, instruction, outfitNote].filter(Boolean).join(" ");
+    const head = [raw ? "" : adultAnchor, instruction, heartNote, outfitNote].filter(Boolean).join(" ");
     const names = pair ? [pair.first, pair.second] : [""];
     const parts = (pair ? [traits, pair.traits] : reference ? [traits] : []).map((t) => {
       t = t || "";
@@ -744,8 +787,9 @@ async function render(prompt, reference, ratio, token = undefined, model = saved
       submitted = build();
     }
   }
+  const sentRefs = reference ? [reference, ...moreHearts, ...(pair ? [pair.blob] : []), ...extras.map((o) => o.blob)].slice(0, cap) : [];
   if (submitted.length > limit) throw Error("Shorten the scene to fit the " + limit + "-character prompt limit of " + model + ".");
-  const { blob, cost } = await spicyImage(submitted, model, ratio, width, height, reference ? [reference, ...(pair ? [pair.blob] : []), ...extras.map((o) => o.blob)] : [], token);
+  const { blob, cost } = await spicyImage(submitted, model, ratio, width, height, sentRefs, token);
   const head = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
   const type =
     head[0] === 137 && head[1] === 80 ? "png"
@@ -754,7 +798,7 @@ async function render(prompt, reference, ratio, token = undefined, model = saved
   if (!type || blob.size > 30 * 1024 * 1024) throw Error("SpicyAPI returned an unsupported image.");
   // The short caption is what the chat sees as the picture's description; the full prompt stays in the Gallery.
   const shortCaption = withoutSelfieNote(caption || clean).replace(/\s+/g, " ").slice(0, 400);
-  return { blob: blob.slice(0, blob.size, "image/" + type), type, model, submitted, cost, caption: shortCaption };
+  return { blob: blob.slice(0, blob.size, "image/" + type), type, model, submitted, cost, caption: shortCaption, refsSent: sentRefs.length };
 }
 
 // ---------- Scene state, photo style, locking and delivery ----------
@@ -1250,7 +1294,7 @@ async function maybeDaily(w, chat = w.chat) {
   ] }));
   if (typeof json?.scene !== "string" || !json.scene.trim()) return false;
   const scene = composeScene(json.scene, json.shot, ref ? { ...ctx, tags: false } : ctx);
-  const result = await render(ref ? scene : withIdentity(c, ref, scene), ref?.blob, framingFor(json, ctx), undefined, undefined, traitsForEdit(ref), null, false, json.scene);
+  const result = await render(ref ? scene : withIdentity(c, ref, scene), ref?.blob, framingFor(json, ctx), undefined, undefined, traitsForEdit(ref), null, false, json.scene, await outfitPicture(w.chat, c.id).catch(() => null), ref?.extras?.map((e) => e.blob));
   const next = await absorbState(w.chat, [c], json);
   await deliver(w.chat, c.id, [result], [c.id], [shouldLock(next?.mood || state.mood)], typeof json.caption === "string" ? json.caption.trim().slice(0, 300) : "");
   note("Sent her " + slot + " photo.");
@@ -1517,7 +1561,7 @@ function modelPicker(role, title, allowNone = false) {
         if (role === "gen" && meta.gen === false) facts.push("⚠ this model needs a reference picture");
         if (role === "vision" && meta.vision === false) facts.push("⚠ this model cannot see images");
         if (role === "vision" && !cat.visionKnown) facts.push(providerName(role) + " does not mark which models can see images here; use Test writer + vision");
-        if (imageRoles.has(role) && meta.maxInputs) facts.push("up to " + meta.maxInputs + " reference pictures" + (meta.maxInputs < 2 ? " (no two-person photos)" : ""));
+        if (role === "gen" && meta.maxInputs) facts.push("up to " + meta.maxInputs + " reference pictures");
         if (meta.maxPrompt) facts.push(meta.maxPrompt.toLocaleString() + "-character prompts");
         if (meta.nsfw) facts.push("uncensored");
         const schemaProps = catalog.schemas.get(id)?.properties;
@@ -1526,6 +1570,7 @@ function modelPicker(role, title, allowNone = false) {
         if (!spicyRoles.has(role) && (meta.reasoning || /reason|think|r1/i.test(id))) facts.push("reasoning model: longer replies allowed, temperature left to the model");
 
       } else if (cat.ready) facts.push("not in the " + providerName(role) + " catalogue; it will be sent as typed");
+      if (role === "edit") facts.push(capacityText(id));
       if (role === "gen" && wantsTags(id)) facts.push("tag-style model: scenes are written as tags automatically");
       hint.textContent = facts.join(" · ");
     },
@@ -2154,12 +2199,12 @@ async function pollContext(w, chat = chat, force = false) {
   const scene=refs[0] ? styled : [first.name,first.appearance,styled].filter(Boolean).join(". ");
   // A saved outfit with a picture of it: that picture shows the edit model the clothes.
   const outfitRef=!second && refs[0] ? await outfitPicture(chat, first.id) : null;
-  const rendered=await render(scene,refs[0]?.blob,framingFor(plan.raw,ctx),undefined,undefined,traitsForEdit(refs[0]),pair,false,plan.scene,outfitRef);
+  const rendered=await render(scene,refs[0]?.blob,framingFor(plan.raw,ctx),undefined,undefined,traitsForEdit(refs[0]),pair,false,plan.scene,outfitRef,second ? [] : refs[0]?.extras?.map((e)=>e.blob));
   if (!await stillCurrent()) { await upload(chat,rendered); setStatus(chat, "The chat moved on before the picture was ready; it is in the Gallery."); return; }
   const ids=plan.people.map(c=>c.id);
   const locked=shouldLock(next?.mood || state.mood);
   await deliver(chat,latest.characterId || first.owner || first.id,[rendered],ids,[locked]);
-  setStatus(chat, (photoTaken ? "Pictured the photo taken in the story: " : "Picture posted: ") + plan.people.map(c=>c.name).join(" + ") + (locked ? " (locked)." : "."));
+  setStatus(chat, (photoTaken ? "Pictured the photo taken in the story: " : "Picture posted: ") + plan.people.map(c=>c.name).join(" + ") + (rendered.refsSent ? " · " + rendered.refsSent + " reference picture" + (rendered.refsSent === 1 ? "" : "s") + " sent" : "") + ".");
   await store("settings","put","lastScene/"+chat+"/"+ids.slice().sort().join("|"),plan.scene);
   tell((plan.unprompted&&!userAsked?(ctx.arena==="conversation"?"She sent a photo on her own: ":"Illustrated a story beat: "):"Picture posted: ")+plan.people.map(c=>c.name).join(" + ")+(locked?" (locked).":"."));
   if (panel.open && chatId===chat) refreshRows().catch(()=>{});
@@ -2410,7 +2455,7 @@ async function pictureOutfit(id, item) {
   const scene = composeScene(c.name + " standing full-length, showing off the whole outfit: " + item.outfit, "full-body photo", ctx);
   const outfitRef = item.picture ? { blob: await getPicture(item.picture), title: item.title || "the outfit", notes: item.notes || [] } : null;
   const result = await render(ref ? scene : [c.name, c.appearance, scene].filter(Boolean).join(". "), ref?.blob, "3:4", undefined, undefined, traitsForEdit(ref), null, false,
-    (item.title || "Outfit") + ": full-length photo", outfitRef);
+    (item.title || "Outfit") + ": full-length photo", outfitRef, ref?.extras?.map((e) => e.blob));
   await deliver(chatId, c.owner || c.id, [result], [id], [false]);
   paintState().catch(() => {});
   return "Posted " + c.name + " in " + (item.title || "the outfit") + costText(result) + ".";
@@ -2593,7 +2638,7 @@ button(create, "Generate and post (1 paid call)", async () => {
   const { ref, pair } = await castFor(c, other);
   const ctx = await pictureContext(id, [c, other].filter(Boolean));
   note(ref ? "Editing with the hearted reference…" : "Generating with " + savedModel(false) + "…");
-  const result = await render(withIdentity(c, ref, composeScene(scene, draftShot, ctx)), ref?.blob, draftFraming || framingFor(null, ctx), undefined, undefined, traitsForEdit(ref), pair, false, scene);
+  const result = await render(withIdentity(c, ref, composeScene(scene, draftShot, ctx)), ref?.blob, draftFraming || framingFor(null, ctx), undefined, undefined, traitsForEdit(ref), pair, false, scene, pair ? null : await outfitPicture(id, c.id).catch(() => null), pair ? [] : ref?.extras?.map((e) => e.blob));
   const state = await sceneState(id);
   try {
     await deliver(id, c.owner || c.id, [result], [c.id, other?.id].filter(Boolean), [shouldLock(state.mood)]);
@@ -2652,7 +2697,10 @@ selectedPreview.alt = "Hearted reference";
 selectedPreview.style.cssText =
   "max-height:150px;max-width:200px;object-fit:contain";
 gallery.append(selectedPreview);
-gallery.append(node("small","The reference picture, appearance notes and likeness ratings travel in Marinara character card exports."));
+const extraHearts = node("div", undefined, "actions extra-hearts");
+const refPlanLine = node("small");
+gallery.append(extraHearts, refPlanLine);
+gallery.append(node("small","The reference pictures, appearance notes and likeness ratings travel in Marinara character card exports."));
 const traitsInput = label(gallery, "Appearance · from the hearted photo, used in every picture (likeness ratings refine it)", node("textarea"));
 traitsInput.maxLength = 450;
 traitsInput.placeholder = "Face shape, hair color and cut, distinguishing features, build";
@@ -2673,7 +2721,7 @@ button(galleryControls, "Refresh", async () => {
 });
 button(galleryControls, "Clear heart and learning", async () => {
   if (!characterSelect.value) throw Error("Choose a character first.");
-  await saveProfile(characterSelect.value, {version:1, anchor:null, learning:null, ratings:null});
+  await saveProfile(characterSelect.value, {version:1, anchor:null, learning:null, ratings:null, extras:null});
   await paint();
   note("Cleared the reference and learning from this card.");
 });
@@ -2976,6 +3024,22 @@ async function portableImage(blob) {
   } finally { bitmap.close(); }
 }
 
+// Up to 2 extra hearted pictures per character (other angles of the same person), stored on the card too.
+async function toggleExtraHeart(id, path) {
+  const [owner, slot] = id.split("~friend~");
+  const profile = readProfile(await host("/characters/" + enc(owner)), slot);
+  if (!profile?.anchor) throw Error("Heart a main picture for this character first.");
+  if (profile.anchor.url === path) throw Error("That is already the main heart.");
+  const extras = (Array.isArray(profile.extras) ? profile.extras : []).filter((e) => e?.url && e.url !== profile.anchor.url);
+  if (extras.some((e) => e.url === path)) {
+    await saveProfile(id, { version: 1, extras: extras.filter((e) => e.url !== path) });
+    return "Removed from the extra hearts.";
+  }
+  if (extras.length >= 2) throw Error("A character has at most 2 extra hearts. Remove one first (tap ♥+ on it).");
+  await saveProfile(id, { version: 1, extras: [...extras, { ...(await portableImage(await getPicture(path))), url: path }] });
+  const { max } = refCapacity(savedModel(true));
+  return "Added as an extra heart." + (soloPlan(max).hearts < extras.length + 1 ? " Note: " + savedModel(true) + " takes " + max + " reference picture" + (max === 1 ? "" : "s") + ", so only " + soloPlan(max).hearts + " extra heart" + (soloPlan(max).hearts === 1 ? " is" : "s are") + " sent with it." : "");
+}
 function unpackProfile(profile) {
   if(profile.version!==1) throw Error("This card uses a newer likeness profile format.");
   const a=profile.anchor;
@@ -2985,7 +3049,9 @@ function unpackProfile(profile) {
   const info=profile.learning?.[a.revision] || {};
   return {url:a.url,revision:a.revision,blob:new Blob([Uint8Array.from(atob(a.bytes),c=>c.charCodeAt(0))],{type:a.mime}),
     manual:info.manual, features:info.features || undefined,traits:info.traits||"",
-    votes:Object.fromEntries(Object.entries(profile.ratings||{}).filter(([k,v])=>imgPath(k) && v && ["up","down"].includes(v.direction) && Array.isArray(v.keys)))};
+    votes:Object.fromEntries(Object.entries(profile.ratings||{}).filter(([k,v])=>imgPath(k) && v && ["up","down"].includes(v.direction) && Array.isArray(v.keys))),
+    extras:(Array.isArray(profile.extras)?profile.extras:[]).filter(e=>e && typeof e.bytes==="string" && e.bytes.length<=4*1024*1024 && /^image\/(png|jpeg|webp|gif|avif)$/i.test(e.mime) && e.url!==a.url).slice(0,2)
+      .map(e=>({url:e.url,blob:new Blob([Uint8Array.from(atob(e.bytes),c=>c.charCodeAt(0))],{type:e.mime})}))};
 }
 
 async function writeAnchor(id, ref, migrate=false) {
@@ -3115,6 +3181,7 @@ async function heart(row) {
   if(ref?.url!==path){
     ref={blob:await getPicture(path),url:path,title:row.prompt||"Selected picture",revision:Date.now().toString(36)+Math.random().toString(36).slice(2),traits:ref?.manual?ref.traits:"",manual:ref?.manual||false,votes:ref?.votes||{}};
     ref=await writeAnchor(id,ref);
+    if(ref.extras?.some(e=>e.url===path)) await toggleExtraHeart(id,path).catch(()=>{});
   }
   if(!ref.features && !modelFor("vision")){
     await autoShare(id);
@@ -3143,8 +3210,16 @@ async function paint() {
   if (previewUrl) selectedPreview.src = previewUrl;
   else selectedPreview.removeAttribute("src");
   refStatus.textContent = ref
-    ? "♥ Saved on character card · "+Object.keys(ref.votes||{}).length+" rated pictures. "+traitsForEdit(ref)
+    ? "♥ Main heart · "+Object.keys(ref.votes||{}).length+" rated pictures. "+traitsForEdit(ref)
     : "No heart selected for this character.";
+  for (const im of extraHearts.querySelectorAll("img")) URL.revokeObjectURL(im.src);
+  extraHearts.replaceChildren(...(ref?.extras || []).map((e) => { const im = node("img"); im.src = URL.createObjectURL(e.blob); im.alt = "Extra heart"; im.title = "Extra heart"; return im; }));
+  {
+    const editModel = savedModel(true), { max } = refCapacity(editModel), plan = soloPlan(max), n = ref?.extras?.length || 0;
+    refPlanLine.textContent = !ref ? "" : "Hearts: main" + (n ? " + " + n + " extra (♥+ on a photo adds or removes one, up to 2)" : " only · ♥+ on another photo adds an extra heart (up to 2)") +
+      ". Editing model " + (editModel || "not chosen") + ": " + capacityText(editModel) + "." +
+      (n > plan.hearts ? " ⚠ Only " + plan.hearts + " of your " + n + " extra hearts fit with this model; the rest are skipped." : "");
+  }
   grid.replaceChildren();
   paintAlbum().catch(() => {});
   paintCharacters().catch(() => {});
@@ -3178,7 +3253,11 @@ async function paint() {
       continue;
     }
     item.append(node("small", (r.provider === own ? "Likeness · " : "Marinara · ") + (r.model || "Image")));
-    button(item, ref?.url === path ? "♥" : "♡", () => heart(r)).title = ref?.url === path ? "The hearted reference" : "Use as the hearted reference";
+    button(item, ref?.url === path ? "♥" : "♡", () => heart(r)).title = ref?.url === path ? "The main heart" : "Use as the main heart";
+    if (ref && ref.url !== path && who) {
+      const isExtra = ref.extras?.some((e) => e.url === path);
+      button(item, isExtra ? "♥+" : "♡+", async () => { const msg = await toggleExtraHeart(who, path); await paint(); note(msg); }).title = isExtra ? "Extra heart · tap to remove" : "Add as an extra heart (another angle, up to 2)";
+    }
     if(ref && ref.url!==path) for(const [dir,label] of [["up","👍"],["down","👎"]]){
       const b=button(item,label,async()=>{await rate(r,dir);await paint();});
       b.title=dir==="up"?"Good likeness":"Poor likeness";
