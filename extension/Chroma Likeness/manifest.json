@@ -1,0 +1,15 @@
+{
+  "kind": "marinara.personal-extension",
+  "version": 1,
+  "config": {
+    "name": "Chroma Likeness",
+    "version": "2.5.5",
+    "description": "Consistent, uncensored character pictures for Conversation, Roleplay and Game chats: hearted likeness, outfits and a closet, mood, photo sets, dares, favourites, locked and moving photos, morning and night selfies.",
+    "runtime": "client",
+    "capabilities": [
+      "full_page_access"
+    ],
+    "jsPath": "extension.js",
+    "cssPath": "extension.css"
+  }
+}
