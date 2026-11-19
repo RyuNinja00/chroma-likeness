@@ -218,7 +218,8 @@ async def main():
         await inp("SpicyAPI key").fill("spicy-test-key"); await inp("NanoGPT key").fill("nano-test-key")
         await click("Save settings", 3000)
         await sel("Contextual photos work in").select_option("open")
-        await click("Enable contextual photos", 1200)
+        if "Enable" in await btn("contextual photos").first.inner_text(): await click("contextual photos", 1200)
+        else: await page.wait_for_timeout(1200)
         print("BUTTON:", await btn("contextual photos").first.inner_text())
         # Switch Marinara to the roleplay chat and close the panel
         await page.evaluate("document.querySelector('[data-chat-composer]').dataset.chatId='c2'")

@@ -20,6 +20,9 @@ Send the headers `x-marinara-csrf: 1` and `X-Admin-Secret` (taken from localStor
 | `GET /api/gallery/file/:chat/:file` | Image files |
 
 - Server-side extensions are sandboxed with no network access, which is why this one runs in the client with full page access.
+- Extension storage: `await marinara.storage.get()` returns this extension's stored object, and `await marinara.storage.patch(values)` merges top-level keys. The extension sends `null` to delete a key. It's documented for personal extensions; the code checks it exists and falls back to the browser.
+- Connection keys are encrypted at rest and masked when sent to the browser, so an extension can't read them.
+- Scenes: building a scene from a Conversation creates a Roleplay chat linked to it. Ending it writes a recap into the Conversation and clears the link; abandoning it deletes the scene. The extension finds the link by field-name patterns: `…origin…Id` in the scene's metadata, or `…scene…Id` in the Conversation's.
 - Marinara's own pictures (Illustrator, selfies, scene images) are built from the avatar and the card's appearance, and use the chat's image connection. Chat options: Send Avatar References, Attach Card Appearance.
 - A scene that a character invites you to in a Conversation becomes a new Roleplay chat.
 

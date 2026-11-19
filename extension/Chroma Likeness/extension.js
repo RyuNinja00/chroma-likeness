@@ -49,7 +49,7 @@ const dbPromise = new Promise((resolve, reject) => {
   req.onsuccess = () => resolve(req.result);
   req.onerror = () => reject(req.error);
 });
-async function store(table, op, key, value) {
+async function localStore(table, op, key, value) {
   const db = await dbPromise;
   return new Promise((resolve, reject) => {
     const tx = db.transaction(table, op === "get" ? "readonly" : "readwrite"),
@@ -63,6 +63,76 @@ async function store(table, op, key, value) {
     tx.oncomplete = () => resolve(req.result);
     tx.onabort = () => reject(tx.error || req.error);
   });
+}
+// ---------- Settings kept in Marinara ----------
+// Keys, settings, outfits and mood per chat, scene links, the album and locked photos live in Marinara's
+// own storage for this extension, so they survive clearing the browser and follow you to every device.
+// The browser copy is only a cache; Marinara's copy wins. Job markers and the watcher stay per browser.
+const serverStore = typeof marinara.storage?.get === "function" && typeof marinara.storage?.patch === "function" ? marinara.storage : null;
+let serverData = null, serverError = "", serverPending = {}, serverTimer = 0;
+function syncedKey(key) {
+  return typeof key === "string" && (["config", "lockedIndex", "links"].includes(key) || /^(state|album|lastScene|link)\//.test(key));
+}
+function copyOf(v) {
+  return v === undefined || v === null ? v : JSON.parse(JSON.stringify(v));
+}
+async function loadServer() {
+  if (!serverStore) return null;
+  try { serverData = (await serverStore.get()) || {}; serverError = ""; }
+  catch (e) { serverData = null; serverError = e?.message || String(e); }
+  return serverData;
+}
+function flushServer() {
+  if (serverTimer) { marinara.clearTimeout(serverTimer); serverTimer = 0; }
+  const patch = serverPending;
+  serverPending = {};
+  if (!serverStore || !Object.keys(patch).length) return Promise.resolve();
+  return Promise.resolve(serverStore.patch(patch)).then(
+    () => { serverError = ""; },
+    (e) => { serverError = e?.message || String(e); serverPending = { ...patch, ...serverPending }; },
+  );
+}
+function queueServer(key, value) {
+  serverPending[key] = value === undefined ? null : copyOf(value);
+  if (!serverTimer) serverTimer = marinara.setTimeout(() => { serverTimer = 0; flushServer(); }, 400);
+}
+async function store(table, op, key, value) {
+  if (table === "settings" && serverData && syncedKey(key)) {
+    if (op === "get") {
+      if (serverData[key] !== undefined && serverData[key] !== null) return copyOf(serverData[key]);
+    } else if (op === "put") {
+      serverData[key] = copyOf(value);
+      queueServer(key, value);
+    } else if (op === "delete") {
+      serverData[key] = null;
+      queueServer(key, null);
+    }
+  }
+  return localStore(table, op, key, value);
+}
+// Copies what this browser already has into Marinara, without overwriting what Marinara holds.
+async function migrateToServer() {
+  if (!serverData) return 0;
+  const db = await dbPromise;
+  const entries = await new Promise((resolve, reject) => {
+    const tx = db.transaction("settings", "readonly"), out = [];
+    const req = tx.objectStore("settings").openCursor();
+    req.onsuccess = () => { const c = req.result; if (c) { out.push([c.key, c.value]); c.continue(); } };
+    tx.oncomplete = () => resolve(out);
+    tx.onabort = () => reject(tx.error);
+  });
+  let moved = 0;
+  for (const [key, value] of entries) {
+    if (!syncedKey(key) || value === undefined || value === null) continue;
+    const there = serverData[key];
+    if (there === undefined || there === null) { serverData[key] = copyOf(value); serverPending[key] = copyOf(value); moved++; }
+    else if (key === "config" && typeof there === "object") {
+      // Keys typed in this browser fill gaps in Marinara's copy.
+      for (const k of ["spicyKey", "nanoKey"]) if (!there[k] && value[k]) { there[k] = value[k]; serverPending.config = copyOf(there); moved++; }
+    }
+  }
+  if (moved) await flushServer();
+  return moved;
 }
 async function request(url, opts = {}) {
   let r;
@@ -610,7 +680,7 @@ function referenceEditPrompt(scene, traits) {
 function costText(result) {
   return typeof result?.cost === "number" ? " ($" + result.cost.toFixed(4) + ")" : "";
 }
-async function render(prompt, reference, ratio, token = undefined, model = savedModel(Boolean(reference)), traits = "", pair = null, raw = false, caption = "") {
+async function render(prompt, reference, ratio, token = undefined, model = savedModel(Boolean(reference)), traits = "", pair = null, raw = false, caption = "", outfitRef = null) {
   token ??= imageKey();
   if (!model) throw Error("Choose a SpicyAPI image model in Settings and save it.");
   const clean = prompt.trim();
@@ -629,6 +699,10 @@ async function render(prompt, reference, ratio, token = undefined, model = saved
   ].filter(Boolean).join("\n") : reference && !raw
     ? referenceEditPrompt(clean, traits)
     : clean;
+  // A picture of a saved outfit goes in as image 2, for the clothes only.
+  const outfitBlob = outfitRef?.blob && reference && !pair && !raw && (!meta?.maxInputs || meta.maxInputs >= 2) ? outfitRef.blob : null;
+  const outfitNote = outfitBlob ? "Image 2 shows the outfit (" + outfitRef.title + "): copy only its clothing, shoes and accessories; the person’s face, hair and build come from image 1." : "";
+  if (outfitNote) submitted = outfitNote + "\n" + submitted;
   const tagged = !reference && !pair && wantsTags(model);
   if (!raw) submitted = (tagged ? "adults only, " : adultAnchor + " ") + submitted;
   const limit = meta?.maxPrompt || (reference ? 3000 : 4000);
@@ -637,13 +711,13 @@ async function render(prompt, reference, ratio, token = undefined, model = saved
     const instruction = pair
       ? "Image 1 is " + pair.first + "; image 2 is " + pair.second + ". Keep both likenesses distinct."
       : reference ? "Keep the reference person's face, hair and build." : "";
-    const scene = [raw ? "" : adultAnchor, instruction, "Scene: " + withoutSelfieNote(clean)].filter(Boolean).join(" ");
+    const scene = [raw ? "" : adultAnchor, instruction, outfitNote, "Scene: " + withoutSelfieNote(clean)].filter(Boolean).join(" ");
     const notes = pair ? [traits, pair.traits] : reference ? [traits] : [];
     const budget = notes.length ? Math.max(0, Math.floor((limit - scene.length) / notes.length) - 2) : 0;
     submitted = [scene, ...notes.map((t) => (t || "").slice(0, budget))].filter(Boolean).join(" ");
   }
   if (submitted.length > limit) throw Error("Shorten the scene to fit the " + limit + "-character prompt limit of " + model + ".");
-  const { blob, cost } = await spicyImage(submitted, model, ratio, width, height, reference ? (pair ? [reference, pair.blob] : [reference]) : [], token);
+  const { blob, cost } = await spicyImage(submitted, model, ratio, width, height, reference ? (pair ? [reference, pair.blob] : outfitBlob ? [reference, outfitBlob] : [reference]) : [], token);
   const head = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
   const type =
     head[0] === 137 && head[1] === 80 ? "png"
@@ -765,7 +839,10 @@ function outfitsByName(state, people) {
   for (const p of people) if (state.outfits?.[p.id]) out[p.name] = state.outfits[p.id];
   return out;
 }
-const stateContract = '"outfits":{"<person name>":"<what they are wearing right now, or what is left of it>"},"mood":{"level":<0-10, how charged the exchange is>,"note":"<2-4 words>"}';
+const stateContract = '"outfits":{"<person name>":"<what they are wearing right now, in detail: each garment with colour and fabric, shoes and accessories; or what is left of it>"},"mood":{"level":<0-10, how charged the exchange is>,"note":"<2-4 words>"}';
+// Wardrobe requests in the chat: "add this to your wardrobe", "put on the red dress".
+const closetContract = '"wardrobeAdd":[{"name":"<person name>","title":"<2-5 word name for the outfit>","outfit":"<the whole outfit in full detail: every garment with colour, fabric, cut and fit, plus shoes, accessories and jewellery>"}],"wear":{"<person name>":"<title from that person’s wardrobe>"}';
+const closetRule = 'Fill wardrobeAdd only when the user asks a character to save, keep or add an outfit to their wardrobe or closet, or the character clearly says they are keeping one; describe it from the conversation in full detail. Fill wear only when someone asks a character to put on an outfit from their wardrobe (the roster lists each wardrobe). Leave both out otherwise.';
 // The user's local time lets outfits and light fit the hour (pajamas at 2 a.m., daylight at noon).
 function localTime() {
   return new Date().toLocaleString(undefined, { weekday: "long", hour: "numeric", minute: "2-digit" });
@@ -777,7 +854,22 @@ async function absorbState(chat, people, result) {
   const outfits = {};
   for (const [name, outfit] of Object.entries(result.outfits || {})) {
     const person = people.find((p) => p.name.toLowerCase() === String(name).toLowerCase() || p.id === name);
-    if (person && typeof outfit === "string" && outfit.trim()) outfits[person.id] = outfit.trim().slice(0, 300);
+    if (person && typeof outfit === "string" && outfit.trim()) outfits[person.id] = outfit.trim().slice(0, 600);
+  }
+  const find = (name) => people.find((p) => p.name.toLowerCase() === String(name).toLowerCase() || p.id === name);
+  // Outfits asked to go into the wardrobe: named, detailed and never pruned.
+  for (const add of Array.isArray(result.wardrobeAdd) ? result.wardrobeAdd.slice(0, 3) : []) {
+    const person = find(add?.name), outfit = String(add?.outfit || "").trim();
+    if (!person || outfit.length < 8) continue;
+    const title = String(add.title || "").trim().slice(0, 60) || outfit.slice(0, 40);
+    if (await addToCloset(person.id, outfit, false, title).catch(() => false)) tell("Saved to " + person.name + "’s wardrobe: " + title + ".");
+  }
+  // "Put on the red dress": wear a saved outfit.
+  for (const [name, title] of Object.entries(result.wear && typeof result.wear === "object" ? result.wear : {})) {
+    const person = find(name), item = person && (await findClosetItem(person.id, title).catch(() => null));
+    if (!item) continue;
+    outfits[person.id] = item.outfit;
+    tell(person.name + " is wearing: " + (item.title || item.outfit.slice(0, 60)) + ".");
   }
   const level = Number(result.mood?.level);
   const mood = Number.isFinite(level)
@@ -793,6 +885,12 @@ const initiativeLevels = [
   ["off", "Only when asked"],
   ["sometimes", "Sometimes on her own · charged moments, at most every 6 replies"],
   ["often", "Often on her own · whenever it feels natural, at most every 3 replies"],
+];
+const storyLevels = [
+  ["moments", "Key moments, plus photos taken in the story · at most every 3 replies"],
+  ["often", "Most vivid beats · at most every other reply"],
+  ["photos", "Only when someone in the story takes a photo, or you ask"],
+  ["off", "Never on its own · 📷 Picture the last reply still works"],
 ];
 const lockModes = [
   ["off", "Never lock"],
@@ -915,16 +1013,44 @@ async function writeCloset(id, map) {
   const { owner, extensions } = closetExt(id, map);
   await host("/characters/" + enc(owner), "PATCH", { data: { extensions }, skipVersionSnapshot: true, versionSource: "Chroma Likeness" });
 }
-async function addToCloset(id, outfit, auto = false) {
-  outfit = String(outfit || "").trim().slice(0, 300);
+async function addToCloset(id, outfit, auto = false, title = "") {
+  outfit = String(outfit || "").trim().slice(0, auto ? 600 : 1200);
+  title = String(title || "").trim().slice(0, 60);
   if (outfit.length < 4 || (auto && /^(nothing|nude|naked|bare|undressed)\b/i.test(outfit))) return false;
   const items = await readCloset(id);
-  if (items.some((i) => normOutfit(i.outfit) === normOutfit(outfit))) return false;
-  const map = { ["o" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)]: { outfit, auto, at: Date.now() } };
+  const same = items.find((i) => normOutfit(i.outfit) === normOutfit(outfit) || (title && normOutfit(i.title) === normOutfit(title)));
+  if (same) {
+    // Saving something already collected keeps it for good, with its name and the fuller description.
+    if (auto || (!same.auto && (!title || same.title === title) && same.outfit.length >= outfit.length)) return false;
+    await writeCloset(id, { [same.key]: { outfit: outfit.length > same.outfit.length ? outfit : same.outfit, auto: false, ...(title ? { title } : {}), at: Date.now() } });
+    return true;
+  }
+  const map = { ["o" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)]: { outfit, auto, ...(title ? { title } : {}), at: Date.now() } };
   const autos = items.filter((i) => i.auto);
   if (auto && autos.length >= 15) for (const old of autos.slice(14)) map[old.key] = null;
   await writeCloset(id, map);
   return true;
+}
+async function findClosetItem(id, title) {
+  const want = normOutfit(title);
+  if (!want) return null;
+  const items = await readCloset(id);
+  return items.find((i) => normOutfit(i.title) === want) || items.find((i) => i.title && (normOutfit(i.title).includes(want) || want.includes(normOutfit(i.title))))
+    || items.find((i) => normOutfit(i.outfit).includes(want)) || null;
+}
+// The first picture of a saved outfit is kept with it and shows the clothes in later pictures.
+async function rememberOutfitPicture(id, outfit, item) {
+  if (!item?.url) return;
+  const item2 = (await readCloset(id)).find((i) => !i.auto && !i.picture && normOutfit(i.outfit) === normOutfit(outfit));
+  if (!item2) return;
+  const path = imgPath(item.url), lock = (await lockedEntries())[path];
+  await writeCloset(id, { [item2.key]: { picture: lock ? imgPath(lock.real.url) : path } });
+}
+async function outfitPicture(id, outfit) {
+  const item = (await readCloset(id).catch(() => [])).find((i) => i.picture && normOutfit(i.outfit) === normOutfit(outfit));
+  if (!item) return null;
+  const blob = await getPicture(item.picture).catch(() => null);
+  return blob ? { blob, title: item.title || "the saved outfit" } : null;
 }
 // Gallery prompts hold the full technical request; keep only the scene for chat captions.
 function cleanCaption(prompt) {
@@ -1193,15 +1319,15 @@ function options(select, items) {
   select.replaceChildren(...items.map(([id, text]) => new Option(text, id)));
 }
 const settings = section("Settings and diagnostics", true);
-const keyInput = label(settings, "SpicyAPI key (saved in this browser · spicyapi.ai → API keys)", node("input"));
+const keyInput = label(settings, "SpicyAPI key (spicyapi.ai → API keys)", node("input"));
 keyInput.type = "password";
 keyInput.autocomplete = "off";
 const textProviderSelect = label(settings, "Writing and vision run on", node("select"));
 options(textProviderSelect, [["nanogpt", "NanoGPT (your main LLM)"], ["spicyapi", "SpicyAPI"]]);
-const nanoKeyInput = label(settings, "NanoGPT key (saved in this browser)", node("input"));
+const nanoKeyInput = label(settings, "NanoGPT key", node("input"));
 nanoKeyInput.type = "password";
 nanoKeyInput.autocomplete = "off";
-settings.append(node("small", "Pictures always use SpicyAPI. Marinara keeps its connection keys encrypted on the server and does not hand them to extensions, so paste the same keys you use in Marinara."));
+settings.append(node("small", "Pictures always use SpicyAPI. Marinara keeps its connection keys encrypted on the server and does not hand them to extensions, so paste the same keys you use in Marinara. They are kept in Marinara’s storage for this extension, so they survive clearing the browser and work on every device."));
 
 // A model dropdown: your SpicyAPI connections in Marinara first, then SpicyAPI's live catalogue.
 const pickers = {};
@@ -1363,8 +1489,10 @@ const heat = label(settings, "Heat · how far scene drafts and contextual photos
 options(heat, heatLevels);
 const styleSelect = label(settings, "Photo style", node("select"));
 options(styleSelect, photoStyles);
-const initiativeSelect = label(settings, "Photos she sends on her own (contextual mode)", node("select"));
+const initiativeSelect = label(settings, "Chat (Conversation) · photos she sends on her own", node("select"));
 options(initiativeSelect, initiativeLevels);
+const storySelect = label(settings, "Roleplay and Game · pictures of the story", node("select"));
+options(storySelect, storyLevels);
 const lockSelect = label(settings, "Locked photos · arrive blurred until you tap 🔓", node("select"));
 options(lockSelect, lockModes);
 const dareSelect = label(settings, "Dares in chat (contextual mode) · answered with a 3-photo set", node("select"));
@@ -1422,6 +1550,35 @@ button(controls, "Auto-configure from Marinara", async () => {
   const done = await autoConfigure(true);
   note("Auto-configured:\n" + (done.join("\n") || "no models available yet — check your keys"));
 });
+// The settings form, filled from the saved settings (at start and after Reload from Marinara).
+function fillForm() {
+  keyInput.value = config.spicyKey || "";
+  nanoKeyInput.value = config.nanoKey || "";
+  textProviderSelect.value = textProvider();
+  relayInput.value = config.relay || "";
+  heat.value = config.heat || "flirty";
+  styleSelect.value = config.style || "auto";
+  initiativeSelect.value = config.initiative || "off";
+  storySelect.value = config.story || "moments";
+  lockSelect.value = config.lock || "off";
+  dareSelect.value = config.dares || "on";
+  negativeInput.value = config.negative === undefined ? defaultNegative : config.negative;
+  dailySelect.value = config.daily || "off";
+  shareSelect.value = config.share ? "on" : "off";
+  ratio.value = config.ratio || "auto";
+  videoSwitch.value = config.videoOn === false ? "off" : "on";
+}
+button(controls, "Reload settings from Marinara", async () => {
+  if (!serverStore) throw Error("This version of Marinara does not give extensions their own storage, so settings stay in this browser.");
+  if (!(await loadServer())) throw Error("Could not read the settings saved in Marinara: " + serverError);
+  config = (await store("settings", "get", "config")) || config;
+  lockedIndex = null;
+  textProviderOverride = null;
+  fillForm();
+  await refreshPickers(true).catch(() => {});
+  paintArena().catch(() => {});
+  note("Reloaded keys and settings from Marinara.");
+});
 button(controls, "Refresh model lists", async () => {
   connections = await host("/connections");
   await withFormSettings(() => refreshPickers(true));
@@ -1438,6 +1595,7 @@ button(controls, "Save settings", async () => {
     heat: heat.value,
     style: styleSelect.value,
     initiative: initiativeSelect.value,
+    story: storySelect.value,
     lock: lockSelect.value,
     dares: dareSelect.value,
     negative: negativeInput.value.trim(),
@@ -1452,6 +1610,7 @@ button(controls, "Save settings", async () => {
   textProviderOverride = null;
   if (!config.autoConfigured) refreshPickers(true).then(maybeAutoConfigure).catch(() => {});
   await store("settings", "put", "config", config);
+  await autoWatch();
   updateConnections();
   paintArena().catch(() => {});
   if (panel.open) paint().catch(() => {});
@@ -1571,16 +1730,32 @@ const scope = section("Chat and character", true);
 const chatSelect = label(scope, "Target chat", node("select")),
   characterSelect = label(scope, "Character", node("select"));
 const arenaLine = node("small");
+arenaLine.style.whiteSpace = "pre-line";
 scope.append(arenaLine);
 async function paintArena() {
   if (!chatId) { arenaLine.textContent = ""; return; }
   const arena = await chatArena(chatId), style = styleFor(arena);
-  arenaLine.textContent = "Detected: " + arenaNames[arena] + " chat · " + {
-    phone: "phone-photo style", scene: "story-scene style (phone shots only when the story has one)",
-    candid: "candid style", editorial: "photo-shoot style",
-  }[style] + " · " + (config.ratio && config.ratio !== "auto" ? "framing fixed at " + config.ratio : (arena === "conversation" ? "portrait" : "landscape") + " unless the writer picks otherwise") + ".";
+  const watching = watch?.mode === "context" ? (watch.chat === "*" ? "watching whichever chat is open" : watch.chat === chatId ? "watching this chat" : "watching another chat only") : "not watching (contextual photos are off)";
+  const pictures = arena === "conversation"
+    ? { off: "pictures when asked", sometimes: "pictures when asked, sometimes on her own", often: "pictures when asked, often on her own" }[config.initiative || "off"]
+    : { moments: "key story moments", often: "most vivid story beats", photos: "only photos taken in the story", off: "no story pictures on its own" }[config.story || "moments"];
+  const keys = "SpicyAPI key " + (spicyKey() ? "✓" : "missing") + " · " + textProviderNames[textProvider()] + " key " + (textKey() ? "✓" : "missing");
+  const where = serverData ? "settings stored in Marinara" : "settings stored in this browser only" + (serverError ? " (" + serverError + ")" : serverStore ? "" : "; this Marinara offers extensions no storage");
+  const link = await store("settings", "get", "link/" + chatId).catch(() => null);
+  const last = chatStatus.get(chatId);
+  arenaLine.textContent = [
+    "Detected: " + arenaNames[arena] + " chat · " + {
+      phone: "phone-photo style", scene: "story-scene style (phone shots only when the story has one)",
+      candid: "candid style", editorial: "photo-shoot style",
+    }[style] + " · " + (config.ratio && config.ratio !== "auto" ? "framing fixed at " + config.ratio : (arena === "conversation" ? "portrait" : "landscape") + " unless the writer picks otherwise") + ".",
+    "Status: " + watching + " · " + pictures + ".",
+    keys + " · " + where + ".",
+    link ? "Scene from a Chat: outfits and mood carried over; they go back when the scene ends." : "",
+    last ? "Last reply (" + new Date(last.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) + "): " + last.text : "",
+  ].filter(Boolean).join("\n");
 }
 const native = section("Built-in selfies and Illustrator");
+native.hidden = true; // Likeness makes every picture itself; Illustrator stays off.
 const connection = label(
   native,
   "Marinara image connection for built-in selfies and Illustrator",
@@ -1623,21 +1798,37 @@ button(native, "Apply portrait settings to this chat", async () => {
 const smart = section("Contextual chat photos", true);
 const scopeSelect = label(smart, "Contextual photos work in", node("select"));
 options(scopeSelect, [["open", "Whichever chat is open in Marinara"], ["chat", "Only the chat selected above"]]);
+function watchMatchesScope() {
+  return watch?.mode === "context" && (scopeSelect.value === "open" ? watch.chat === "*" : watch.chat === chatId);
+}
 const smartButton = button(smart, "Enable contextual photos", async () => {
-  if (watch?.mode === "context" && (watch.chat === chatId || watch.chat === "*")) {
+  if (watchMatchesScope()) {
     await store("settings","delete","watch");
     watch = null;
+    config = { ...config, contextOff: true };
   } else {
-    if (!chatId || !textKey() || !imageKey()) throw Error("Select a chat and save API keys for your text and image providers.");
-    const messages = await recentTurns(chatId);
+    if ((scopeSelect.value !== "open" && !chatId) || !textKey() || !imageKey()) throw Error("Select a chat and save API keys for your text and image providers.");
     const next = {chat:scopeSelect.value==="open" ? "*" : chatId, mode:"context", session:uid()};
     await store("settings","put","watch",next);
     lastTurns.clear();
-    if (next.chat !== "*") lastTurns.set(chatId, messages.at(-1)?.id);
+    if (next.chat !== "*") lastTurns.set(chatId, (await recentTurns(chatId)).at(-1)?.id);
     watch = next;
+    config = { ...config, contextOff: false };
   }
+  await store("settings", "put", "config", config);
   watchLabel();
+  paintArena().catch(() => {});
 });
+scopeSelect.addEventListener("change", () => watchLabel(false));
+// Contextual photos run on their own in whichever chat is open, unless you switched them off.
+async function autoWatch() {
+  if (watch?.mode === "context" || config.contextOff || !spicyKey() || !textKey()) return;
+  watch = { chat: "*", mode: "context", session: uid() };
+  await store("settings", "put", "watch", watch);
+  lastTurns.clear();
+  watchLabel();
+  note("Contextual photos are on in whichever chat is open. Switch them off under Contextual chat photos.");
+}
 smart.append(node("small","Checks each new character reply in one chat with your writing model. A selected scene costs one additional image call. This replaces automatic native follow-up edits for the watched chat."));
 button(smart,"📷 Picture the last reply (1 text call + 1 paid image)",async()=>{
   if (!chatId) throw Error("Select a chat first.");
@@ -1675,18 +1866,20 @@ function recentTurns(id) {
 async function planPicture(turns,cast,state={outfits:{},mood:null},chat=chatId,force=false) {
   if (!turns.length || !cast.length) return null;
   const ctx = await pictureContext(chat, cast.filter((c) => !c.owner).slice(0, 1));
-  const roster = cast.map(c=>({id:c.id,name:c.name,friendOf:c.owner || undefined,currentOutfit:state.outfits?.[c.id] || undefined}));
+  const wardrobes = await Promise.all(cast.map((c) => readCloset(c.id).catch(() => [])));
+  const roster = cast.map((c, i)=>({id:c.id,name:c.name,friendOf:c.owner || undefined,currentOutfit:state.outfits?.[c.id] || undefined,
+    wardrobe:wardrobes[i].filter((o) => !o.auto).map((o) => o.title || o.outfit.slice(0, 60)).slice(0, 20)}));
   const conversation = turns.map(m=>{
     const extra=parse(m.extra,{});
     return {role:m.role,speakerCard:m.characterId,text:m.content?.slice(-1600),
       pictured:extra.likenessCast,hasPicture:extra.attachments?.some(a=>a.type==="image"||a.type==="video") || undefined};
   });
-  const initiative = config.initiative || "off";
   const story = ctx.arena !== "conversation";
+  const initiative = story ? ({ moments: "sometimes", often: "often" }[config.story || "moments"] || "off") : (config.initiative || "off");
   const initiativeRule = initiative === "off"
     ? (story ? ' Only picture a moment when the story has someone take or send a photo, or the user asks for a picture; set "unprompted":false.' : ' Never send a photo nobody asked for; set "unprompted":false.')
     : story
-      ? ' Also picture a story beat on your own when it is ' + (initiative === "often" ? "vivid: arriving somewhere new, a change of outfit or look, an intimate, charged or dramatic moment" : "a clear high point: a striking new place, an outfit reveal, or an intimate or charged moment") + '. Then set "unprompted":true. Never do this right after a picture.'
+      ? ' Also picture a story beat on your own when it is ' + (initiative === "often" ? "vivid: arriving somewhere new, a change of outfit or look, an intimate, charged or dramatic moment" : "a key moment: arriving somewhere new, an outfit reveal, a first kiss or touch, or an intimate, charged or dramatic turn") + '. Then set "unprompted":true. Never do this right after a picture.'
       : ' The character may also send a photo on her own, unasked, when ' + (initiative === "often" ? "it would feel natural: showing off an outfit or place, teasing, flirting, or a charged moment" : "the exchange is clearly flirtatious or charged and a photo would land") + '. Then set "unprompted":true. Never do this right after a photo was already sent.';
   const opener = story
     ? 'Decide if the latest story beat should be shown as a picture. The conversation is a ' + arenaNames[ctx.arena] + ' story.'
@@ -1694,7 +1887,7 @@ async function planPicture(turns,cast,state={outfits:{},mood:null},chat=chatId,f
   const response=await chatCompletion({
     model:modelFor("writer"),max_tokens:1100,temperature:0.3,
     messages:[{role:"system",content:
-      opener + ' Return JSON only: {"pictured":["exact roster id"],"scene":"<picture prompt>","shot":"<shot type>","framing":"portrait|landscape|square","unprompted":false,"continues":false,"dare":false,' + stateContract + '}. Return {"pictured":[],' + stateContract + '} for no photo, still reporting the mood. If the user just reacted to the last picture wanting more (more, another, keep going, wow, 🔥), set "continues":true and write the next, slightly bolder picture of the same set: same place and light. If the user dares or challenges her to show something, set "dare":true and picture who answers it. The latest exchange is the last user message plus the replies after it; use older turns for context. A request for a photo, someone offering or sending one now, or an active character posing for a natural shared photo are cues. A passing mention, postponed or declined photo, or a request already fulfilled is insufficient.' + initiativeRule + ' Resolve pronouns, relationships and quoted dialogue. The speaker card can voice a friend. Distinguish sender and photographer from the people visible. "Show me your friend" pictures the friend alone. "Both of you" pictures the two people referred to. A friend taking over and sending a selfie pictures herself. When the user’s own character takes a photo of someone (snaps a picture, films, points a camera), picture the people being photographed, from that camera’s point of view; that counts as asked, so "unprompted" is false.' + (force ? ' The user has asked for a picture of this moment: you must choose who is visible and describe it.' : '') + ' Name each visible person in the scene with their current pose, clothes and surroundings. ' + wardrobeRule + ' Do not invent appearance; do not describe face or hair. Choose one or two known people. For uncertain identity, an unknown subject or a larger group, skip the photo.' + styleGuide(ctx) + ' Scene tone: '+heatRule(state.mood)},
+      opener + ' Return JSON only: {"pictured":["exact roster id"],"scene":"<picture prompt>","shot":"<shot type>","framing":"portrait|landscape|square","unprompted":false,"continues":false,"dare":false,' + stateContract + ',' + closetContract + '}. ' + closetRule + ' Return {"pictured":[],' + stateContract + '} for no photo, still reporting the mood. If the user just reacted to the last picture wanting more (more, another, keep going, wow, 🔥), set "continues":true and write the next, slightly bolder picture of the same set: same place and light. If the user dares or challenges her to show something, set "dare":true and picture who answers it. The latest exchange is the last user message plus the replies after it; use older turns for context. A request for a photo, someone offering or sending one now, or an active character posing for a natural shared photo are cues. A passing mention, postponed or declined photo, or a request already fulfilled is insufficient.' + initiativeRule + ' Resolve pronouns, relationships and quoted dialogue. The speaker card can voice a friend. Distinguish sender and photographer from the people visible. "Show me your friend" pictures the friend alone. "Both of you" pictures the two people referred to. A friend taking over and sending a selfie pictures herself. When the user’s own character takes a photo of someone (snaps a picture, films, points a camera), picture the people being photographed, from that camera’s point of view; that counts as asked, so "unprompted" is false.' + (force ? ' The user has asked for a picture of this moment: you must choose who is visible and describe it.' : '') + ' Name each visible person in the scene with their current pose, clothes and surroundings. ' + wardrobeRule + ' Do not invent appearance; do not describe face or hair. Choose one or two known people. For uncertain identity, an unknown subject or a larger group, skip the photo.' + styleGuide(ctx) + ' Scene tone: '+heatRule(state.mood)},
     {role:"user",content:JSON.stringify({localTime:localTime(),roster,conversation})}]
   });
   let plan=replyJson(response,"pictured");
@@ -1703,7 +1896,7 @@ async function planPicture(turns,cast,state={outfits:{},mood:null},chat=chatId,f
     const retry=await chatCompletion({
       model:modelFor("writer"),max_tokens:2000,temperature:0.2,
       messages:[
-        {role:"system",content:'You turn a decision into JSON. Return one JSON object and nothing else, no story text, no commentary: {"pictured":["exact roster id"],"scene":"<picture prompt>","shot":"<shot type>","framing":"portrait|landscape|square","unprompted":false,"continues":false,"dare":false,' + stateContract + '}. Use {"pictured":[]} for no picture. Roster: ' + JSON.stringify(roster)},
+        {role:"system",content:'You turn a decision into JSON. Return one JSON object and nothing else, no story text, no commentary: {"pictured":["exact roster id"],"scene":"<picture prompt>","shot":"<shot type>","framing":"portrait|landscape|square","unprompted":false,"continues":false,"dare":false,' + stateContract + ',' + closetContract + '}. ' + closetRule + ' Use {"pictured":[]} for no picture. Roster: ' + JSON.stringify(roster)},
         {role:"user",content:JSON.stringify({latest:conversation.slice(-3),earlierAnswer:replyText(response).slice(0,3000)})}
       ]
     }).catch(()=>null);
@@ -1736,12 +1929,18 @@ async function pollContext(w, chat = chat, force = false) {
   const latest=turns.at(-1);
   if (!latest) { if (force) throw Error("This chat has no messages yet."); return; }
   if (!force) {
-    // In follow-the-open-chat mode, the first look at a chat only notes where it is.
-    if (!lastTurns.has(chat)) { lastTurns.set(chat, latest.id); if (chat !== w.chat) return; }
+    // The first look at a chat notes where it is, unless its latest reply is new (a scene just
+    // opened, say): that reply is checked straight away.
+    if (!lastTurns.has(chat)) {
+      const age = Date.now() - Date.parse(latest.createdAt || "");
+      const fresh = isReply(latest) && age >= 0 && age < 5 * 60000;
+      lastTurns.set(chat, fresh ? "" : latest.id);
+      if (!fresh && chat !== w.chat) { setStatus(chat, "Watching this chat; the next reply is checked."); return; }
+    }
     if (watch!==w || lastTurns.get(chat)===latest.id) return;
     if (!isReply(latest) || !latest.content?.trim() || parse(latest.extra,{})?.chromaLikeness) return;
     // Marinara's own selfie or Illustrator already pictured this reply: do not add a second one.
-    if (parse(latest.extra,{})?.attachments?.some(a=>a.type==="image")) { lastTurns.set(chat, latest.id); return; }
+    if (parse(latest.extra,{})?.attachments?.some(a=>a.type==="image")) { lastTurns.set(chat, latest.id); setStatus(chat, "That reply already had a picture from Marinara (Illustrator), so Likeness left it."); return; }
     const job="context/"+chat+"/"+latest.id;
     try { await store("jobs","add",job,{status:"checking"}); }
     catch(e){if(e.name!=="ConstraintError")throw e; lastTurns.set(chat, latest.id); return;}
@@ -1754,15 +1953,20 @@ async function pollContext(w, chat = chat, force = false) {
   const state=await sceneState(chat);
   const plan=await planPicture(turns,roster,state,chat,force);
   if (!plan || (!force && watch!==w) || !alive) return;
-  // The mood is tracked on every checked reply, photo or not.
-  const next=await absorbState(chat,plan.people.length?plan.people:roster,plan.raw);
+  // Mood, outfits and wardrobe requests are tracked on every checked reply, photo or not.
+  const next=await absorbState(chat,roster,plan.raw);
+  const story=(await chatArena(chat))!=="conversation";
+  const level=story ? (config.story || "moments") : (config.initiative || "off");
   if (!plan.people.length) {
+    setStatus(chat, plan.raw===null ? "No picture: the writing model’s answer could not be read." : story && level==="photos" ? "No picture: nobody took a photo in that reply." : "No picture: the writer saw nothing to picture.");
     if (force || userAsked) tell(force ? "The writer could not tell who is in the picture. Choose the character and use Generate and post instead." : "Likeness decided not to picture that reply. Open ♡ Likeness → Contextual photos → 📷 Picture the last reply to make one anyway.");
     return;
   }
+  if (story && level==="off" && !userAsked && !force) { setStatus(chat, "No picture: Roleplay and Game pictures are off in Settings."); return; }
   if (plan.unprompted && !plan.continues && !plan.dare && !userAsked && !force) {
-    const gap = config.initiative === "often" ? 3 : 6;
-    if (config.initiative === "off" || repliesSincePicture(turns) < gap) return;
+    const gap = { often: story ? 2 : 3, moments: 3, sometimes: 6 }[level];
+    const since = repliesSincePicture(turns);
+    if (!gap || since < gap) { setStatus(chat, !gap ? "No picture: nobody asked for one and pictures on her own are off." : "No picture yet: the last one was " + since + " replies ago (at least " + gap + " between pictures nobody asked for)."); return; }
   }
   const refs=await Promise.all(plan.people.map(c=>cardReference(c.id)));
   const [first,second]=plan.people;
@@ -1795,11 +1999,16 @@ async function pollContext(w, chat = chat, force = false) {
   const ctx={...plan.ctx,tags:plan.ctx.tags && !refs[0]};
   const styled=composeScene(plan.scene,plan.shot,ctx);
   const scene=refs[0] ? styled : [first.name,first.appearance,styled].filter(Boolean).join(". ");
-  const rendered=await render(scene,refs[0]?.blob,framingFor(plan.raw,ctx),undefined,undefined,traitsForEdit(refs[0]),pair,false,plan.scene);
-  if (!await stillCurrent()) { await upload(chat,rendered); return; }
+  // A saved outfit with a picture of it: that picture shows the edit model the clothes.
+  const wearing=(next || state).outfits?.[first.id];
+  const outfitRef=!second && refs[0] && wearing ? await outfitPicture(first.id, wearing) : null;
+  const rendered=await render(scene,refs[0]?.blob,framingFor(plan.raw,ctx),undefined,undefined,traitsForEdit(refs[0]),pair,false,plan.scene,outfitRef);
+  if (!await stillCurrent()) { await upload(chat,rendered); setStatus(chat, "The chat moved on before the picture was ready; it is in the Gallery."); return; }
   const ids=plan.people.map(c=>c.id);
   const locked=shouldLock(next?.mood || state.mood);
-  await deliver(chat,latest.characterId || first.owner || first.id,[rendered],ids,[locked]);
+  const sent=await deliver(chat,latest.characterId || first.owner || first.id,[rendered],ids,[locked]);
+  if (!second && wearing) rememberOutfitPicture(first.id, wearing, sent[0]).catch(() => {});
+  setStatus(chat, "Picture posted: " + plan.people.map(c=>c.name).join(" + ") + (locked ? " (locked)." : "."));
   await store("settings","put","lastScene/"+chat+"/"+ids.slice().sort().join("|"),plan.scene);
   tell((plan.unprompted&&!userAsked?(ctx.arena==="conversation"?"She sent a photo on her own: ":"Illustrated a story beat: "):"Picture posted: ")+plan.people.map(c=>c.name).join(" + ")+(locked?" (locked).":"."));
   if (panel.open && chatId===chat) refreshRows().catch(()=>{});
@@ -1836,10 +2045,10 @@ native.append(
     "While Marinara is open, each eligible new native picture from the saved generation model with a hearted character gets one additional paid edit, saved as a new chat picture. Images without a single identified character are skipped. Only one chat is watched at a time.",
   ),
 );
-function watchLabel() {
-  const on = watch?.mode==="context" && (watch.chat===chatId || watch.chat==="*");
+function watchLabel(syncScope = true) {
+  if (syncScope && watch?.mode==="context") scopeSelect.value = watch.chat==="*" ? "open" : "chat";
+  const on = watchMatchesScope();
   smartButton.textContent = on ? "Disable contextual photos" + (watch.chat==="*" ? " (all chats)" : "") : "Enable contextual photos";
-  if (watch?.mode==="context") scopeSelect.value = watch.chat==="*" ? "open" : "chat";
   watchButton.textContent =
     watch?.chat === chatId && watch.mode!=="context"
       ? "Disable automatic follow-up edits"
@@ -1924,7 +2133,7 @@ async function paintCloset() {
   if (!id) { options(closetSelect, [["", "Choose a character"]]); return; }
   const items = await readCloset(id).catch(() => []);
   options(closetSelect, items.length
-    ? items.map((i) => [i.key, (i.auto ? "" : "★ ") + i.outfit.slice(0, 90)])
+    ? items.map((i) => [i.key, (i.auto ? "" : "★ ") + (i.title ? i.title + " · " : "") + i.outfit.slice(0, 90) + (i.picture ? " 📷" : "")])
     : [["", "Empty · photos and Save to closet fill it"]]);
 }
 const closetControls = node("div", undefined, "actions");
@@ -2630,7 +2839,96 @@ async function paint() {
     grid.append(item);
   }
 }
-let lastPollError = "";
+let lastPollError = "", pollChat = "", warnedMissing = "";
+// What happened with the latest reply in each chat, for the status line.
+const chatStatus = new Map();
+function setStatus(chat, text) {
+  if (!chat) return;
+  chatStatus.set(chat, { text, at: Date.now() });
+  if (panel.open && chat === chatId) paintArena().catch(() => {});
+}
+// ---------- Scenes built from a Chat ----------
+// Marinara links a Roleplay scene to the Conversation it came from. Field names vary between versions,
+// so look for any metadata field that names the other chat: "...origin...Id" on the scene, or
+// "...scene...Id" on the Conversation.
+function linkedChatId(meta, self, keyTest) {
+  const seen = new Set();
+  const walk = (o, depth) => {
+    if (!o || typeof o !== "object" || depth > 2 || seen.has(o)) return "";
+    seen.add(o);
+    for (const [k, v] of Object.entries(o)) if (typeof v === "string" && v && v !== self && keyTest(k)) return v;
+    for (const v of Object.values(o)) { const found = walk(v, depth + 1); if (found) return found; }
+    return "";
+  };
+  return walk(parse(meta, {}), 0);
+}
+const originKey = (k) => /origin/i.test(k) && /id$/i.test(k);
+const sceneLinkKey = (k) => /scene/i.test(k) && /id$/i.test(k) && !/origin/i.test(k);
+const linkChecks = new Map();
+let lastLinkChat = "";
+async function linkChats(chat) {
+  // Straight away when you switch chats (back from a scene, say), otherwise once a minute.
+  if (chat === lastLinkChat && Date.now() - (linkChecks.get(chat) || 0) < 60000) return;
+  lastLinkChat = chat;
+  linkChecks.set(chat, Date.now());
+  const info = await host("/chats/" + enc(chat));
+  if (info.mode === "conversation") {
+    const scene = linkedChatId(info.metadata, chat, sceneLinkKey);
+    if (scene && !(await store("settings", "get", "link/" + scene))) await linkScene(scene, chat);
+    await checkReturns(chat, info);
+  } else {
+    const origin = linkedChatId(info.metadata, chat, originKey);
+    if (origin && !(await store("settings", "get", "link/" + chat))) await linkScene(chat, origin);
+  }
+}
+async function linkScene(scene, origin) {
+  const from = await sceneState(origin), here = await sceneState(scene);
+  const carried = Object.keys(from.outfits || {}).length > 0 || Boolean(from.mood);
+  if (!Object.keys(here.outfits || {}).length) await saveSceneState(scene, { outfits: { ...(from.outfits || {}) }, mood: here.mood || from.mood || null });
+  await store("settings", "put", "link/" + scene, { origin, at: Date.now() });
+  const links = ((await store("settings", "get", "links")) || []).filter((l) => l.scene !== scene);
+  links.push({ scene, origin, at: Date.now() });
+  await store("settings", "put", "links", links.slice(-30));
+  if (carried) tell("Scene linked to your Chat: outfits and mood carried over.");
+  setStatus(scene, "Scene linked to its Chat" + (carried ? "; outfits and mood carried over." : "."));
+}
+// Back in the Chat after End scene: bring the outfits and mood home and share a photo from the scene.
+async function checkReturns(chat, info) {
+  const links = (await store("settings", "get", "links")) || [];
+  const pending = links.filter((l) => l.origin === chat && !l.returned);
+  if (!pending.length) return;
+  const turns = await host("/chats/" + enc(chat) + "/messages?limit=16").catch(() => []);
+  for (const link of pending) {
+    const scene = await host("/chats/" + enc(link.scene)).catch(() => null);
+    const recap = turns.some((m) => String(m.extra || "").includes(link.scene) && Date.parse(m.createdAt || "") >= link.at - 60000);
+    const stillLinked = scene && (linkedChatId(scene.metadata, link.scene, originKey) === chat || linkedChatId(info.metadata, chat, sceneLinkKey) === link.scene);
+    const concluded = scene && /"[^"]*status"\s*:\s*"(conclu|ended|end|complete|done|abandon)/i.test(JSON.stringify(parse(scene.metadata, {})));
+    if (scene && !recap && !concluded && stillLinked) continue;
+    link.returned = Date.now();
+    await store("settings", "put", "links", links);
+    if (!scene) continue; // abandoned and deleted: nothing to bring back
+    const st = await sceneState(link.scene);
+    if (Object.keys(st.outfits || {}).length || st.mood) await saveSceneState(chat, { outfits: st.outfits || {}, ...(st.mood ? { mood: st.mood } : {}) });
+    const cast = await chatCast(link.scene).catch(() => []);
+    let pick = null;
+    for (const c of cast) {
+      const fav = (await albumOf(c.id)).find((f) => f.chat === link.scene);
+      if (fav) { pick = { path: fav.path, caption: fav.caption, who: c }; break; }
+    }
+    if (!pick) {
+      const last = await lastLikenessPicture(await recentTurns(link.scene).catch(() => [])).catch(() => null);
+      if (last?.path && cast[0]) pick = { path: last.path, caption: last.caption, who: cast[0] };
+    }
+    if (pick) {
+      const blob = await getPicture(pick.path);
+      const type = (blob.type.split("/")[1] || "png").replace("jpg", "jpeg");
+      const caption = "From our scene" + (pick.caption ? ": " + cleanCaption(pick.caption) : "");
+      await deliver(chat, pick.who.owner || pick.who.id, [{ blob, type, model: "scene photo", submitted: caption, caption }], [pick.who.id], [false]);
+    }
+    tell("Back from the scene: " + (pick ? "a photo from it is in the chat, and " : "") + "outfits and mood came back with you.");
+    setStatus(chat, "Back from a scene" + (pick ? "; posted a photo from it." : "."));
+  }
+}
 async function poll() {
   if (!watch || polling || busy || initializing || !alive) return;
   const w = watch;
@@ -2644,7 +2942,17 @@ async function poll() {
     }
     if(w.mode==="context"){
       const chat = w.chat === "*" ? currentChat() : w.chat;
-      if (chat && !await maybeDaily(w, chat)) await pollContext(w, chat);
+      if (!chat) return;
+      pollChat = chat;
+      const missing = !spicyKey() ? "SpicyAPI key" : !textKey() ? textProviderNames[textProvider()] + " key" : !modelFor("writer") ? "writing model" : "";
+      if (missing) {
+        setStatus(chat, "Paused: no " + missing + " is saved. Open ♡ Likeness → Settings.");
+        if (warnedMissing !== missing) { warnedMissing = missing; tell("Likeness is paused: no " + missing + " is saved. Open ♡ Likeness → Settings to add it."); }
+        return;
+      }
+      warnedMissing = "";
+      await linkChats(chat).catch(() => {});
+      if (!await maybeDaily(w, chat)) await pollContext(w, chat);
       lastPollError=""; return;
     }
     const all = await host("/gallery/" + enc(w.chat));
@@ -2694,6 +3002,7 @@ async function poll() {
     }
     lastPollError = "";
   } catch (e) {
+    if (pollChat) setStatus(pollChat, "Error: " + e.message);
     if (alive && lastPollError !== e.message) {
       lastPollError = e.message;
       fail(e);
@@ -2701,6 +3010,7 @@ async function poll() {
     }
   } finally {
     polling = false;
+    pollChat = "";
   }
 }
 // A contextual heart for Marinara-hosted chat and gallery images. No fetch interception or changes to chat controls.
@@ -2784,9 +3094,12 @@ marinara.onCleanup(() => {
   feedbackToast.remove();inline.remove();
   panel.remove();
   launcher.remove();
+  flushServer().catch(() => {});
   dbPromise.then((db) => db.close()).catch(() => {});
 });
 try {
+  await loadServer();
+  await migrateToServer().catch(() => 0);
   config = (await store("settings", "get", "config")) || {};
   // 2.0 is SpicyAPI-only: earlier provider keys and per-provider model choices are dropped once.
   if ((config.version || 1) < 2) {
@@ -2800,21 +3113,9 @@ try {
     config.textProvider = config.textProvider || "spicyapi";
     await store("settings", "put", "config", config);
   }
-  keyInput.value = config.spicyKey || "";
-  nanoKeyInput.value = config.nanoKey || "";
-  textProviderSelect.value = textProvider();
-  relayInput.value = config.relay || "";
-  heat.value = config.heat || "flirty";
-  styleSelect.value = config.style || "auto";
-  initiativeSelect.value = config.initiative || "off";
-  lockSelect.value = config.lock || "off";
-  dareSelect.value = config.dares || "on";
-  negativeInput.value = config.negative === undefined ? defaultNegative : config.negative;
-  dailySelect.value = config.daily || "off";
-  shareSelect.value = config.share ? "on" : "off";
-  ratio.value = config.ratio || "auto";
-  videoSwitch.value = config.videoOn === false ? "off" : "on";
-  const saved = await store("settings", "get", "watch");
+  fillForm();
+  let saved = await store("settings", "get", "watch");
+  if (saved?.chat && saved.mode !== "context") { await store("settings", "delete", "watch"); saved = null; }
   if (saved?.chat) {
     try {
       if(saved.mode==="context" && saved.chat!=="*") lastTurns.set(saved.chat,(await recentTurns(saved.chat)).at(-1)?.id);
@@ -2827,6 +3128,7 @@ try {
       note("Automatic monitoring unavailable: " + e.message);
     }
   }
+  await autoWatch().catch(() => {});
   await lockedEntries();
   await loadLists(currentChat() || watch?.chat);
   refreshPickers().then(maybeAutoConfigure).catch((e) => { catalogStatus.textContent = "Model lists could not load: " + e.message; });

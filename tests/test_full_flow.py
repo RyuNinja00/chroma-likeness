@@ -255,7 +255,8 @@ async def main():
         await inp("Dare her").fill("Show me the new dress... and what is under it")
         await btn("Send dare").first.click(); await page.wait_for_timeout(6000); print("DARE (panel):", await out())
         # Contextual mode: reaction loop and a dare typed in chat
-        await click("Enable contextual photos", 1200)
+        if "Enable" in await btn("contextual photos").first.inner_text(): await click("contextual photos", 1200)
+        else: await page.wait_for_timeout(1200)
         state["planner"] = "continues"
         state["messages"] += [{"id": "u9", "role": "user", "content": "wow 🔥 more!", "createdAt": "2026-11-18T12:01"},
                               {"id": "a9", "role": "assistant", "characterId": "ch1", "content": "*bites lip* You want more? Fine...", "createdAt": "2026-11-18T12:02"}]

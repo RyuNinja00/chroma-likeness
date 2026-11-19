@@ -3,7 +3,7 @@
   "version": 1,
   "config": {
     "name": "Chroma Likeness",
-    "version": "2.5.5",
+    "version": "2.6.0",
     "description": "Consistent, uncensored character pictures for Conversation, Roleplay and Game chats: hearted likeness, outfits and a closet, mood, photo sets, dares, favourites, locked and moving photos, morning and night selfies.",
     "runtime": "client",
     "capabilities": [

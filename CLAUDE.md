@@ -7,17 +7,23 @@ You are picking up **Chroma Likeness**, a Marinara Engine personal extension. Re
 - Uses Marinara Engine, mostly on a phone. Chats in both Conversation and Roleplay modes, including scene chats that Marinara creates from an invite in a Conversation.
 - Uses NanoGPT as their main text model provider and SpicyAPI for pictures and video. Sogni was tried and dropped because the browser blocked it (CORS). Remove other providers rather than adding them back.
 - Adult, uncensored use. Keep the adults-only anchor in every picture prompt.
+- Has turned Marinara's Illustrator off in Chat and Roleplay: Likeness must make every picture itself. Don't rely on Illustrator, selfies or Marinara image connections.
 - Wants things to work automatically: settings worked out from context, prompting that adapts to the model and chat type. Tests the extension live and reports what they see, often briefly ("no picture was produced"). Diagnose the cause from the code before changing it.
 
 ## Architecture (all in `extension.js`)
 
 - Client runtime with `full_page_access`. The file is the body of an async function that receives `marinara` (`fetch`, `onCleanup`, `setInterval`, `setTimeout`, `clearTimeout`). Use those timers so Marinara can clean up.
-- Storage: an IndexedDB database `marinara-chroma-likeness-v1` (settings, references, jobs), plus card extensions on the character (`chromaLikeness…` keys) for anything that should travel with the card: the heart, its traits, the closet.
+- Storage, three layers:
+  - `marinara.storage` (Marinara's per-extension storage) holds `config` (keys too), `lockedIndex`, `links`, and `state/`, `album/`, `lastScene/` and `link/` entries. `store()` writes these through to it (debounced `patch`) and reads them from it first.
+  - IndexedDB `marinara-chroma-likeness-v1` is a local cache, plus per-browser things: `jobs`, `watch`, references.
+  - Card extensions on the character (`chromaLikeness…` keys) hold what should travel with the card: the heart, its traits, the closet.
 - Model catalogues: SpicyAPI `/api/v1/models?includeSchema=1` (inputs are built from each model's schema, because unknown fields return a 400) and NanoGPT `/api/v1/models?detailed=true` (vision, structured output and reasoning flags).
 - Main flows:
   - `render()`: generates or edits a picture via `spicyImage()`.
   - `deliver()` → `postMedia()`: puts the picture in the gallery, then into the chat. In Roleplay the picture is attached to the latest message via PATCH `/extra`; in Conversation it's posted as a separate message. Then `refreshChatView()`.
-  - `poll()` → `pollContext()` → `planPicture()`: the writer decides who to picture and how, and returns JSON read by `replyJson()`.
+  - `poll()` → `linkChats()` (scene ↔ Chat links, `checkReturns()` after End scene) → `pollContext()` → `planPicture()`: the writer decides who to picture and how, and returns JSON read by `replyJson()`. That JSON includes outfits, mood, `wardrobeAdd` and `wear`, which `absorbState()` applies.
+  - Picture rules: Conversation uses `config.initiative`; Roleplay and Game use `config.story` (moments/often/photos/off). `setStatus()` records why each reply did or didn't get a picture, for the status line in `paintArena()`.
+  - Closet items: `{outfit, title?, auto, picture?, at}`. Saved (`auto:false`) items are never pruned. `picture` is passed to `render()` as `outfitRef` (image 2, clothes only).
   - `animatePicture()`, `makeSet()`, `maybeDaily()`, the closet, the album, dares and locked photos.
 - Chat type comes from `chatArena(id)` (`conversation` | `roleplay` | `game`) and controls style through `styleFor()`, `styleGuide()` and `composeScene()`.
 
@@ -26,7 +32,7 @@ You are picking up **Chroma Likeness**, a Marinara Engine personal extension. Re
 - Bump `manifest.json`'s version for every user-visible change, and add a row to `docs/PROJECT-HISTORY.md` (problem, cause, fix) and update its version line.
 - Keep a full copy of the previous `extension.js` before a big edit. Check it still parses: `node -e "new (Object.getPrototypeOf(async function(){}).constructor)('marinara', require('fs').readFileSync('extension/Chroma Likeness/extension.js','utf8'))"`.
 - Avoid straight apostrophes inside single-quoted JS strings; the code uses ’. Write messages the user sees in plain words.
-- Run all three tests (see `tests/README.md`) before packaging. Package with `scripts/package.sh`, which builds `releases/Chroma-Likeness-Marinara-<version>.zip` with the `Chroma Likeness/` folder at the root.
+- Run all four tests (see `tests/README.md`) before packaging. Package with `scripts/package.sh`, which builds `releases/Chroma-Likeness-Marinara-<version>.zip` with the `Chroma Likeness/` folder at the root.
 - After installing a new ZIP, the user must re-approve the extension and reload the tab.
 
 ## Known gotchas
@@ -36,4 +42,5 @@ You are picking up **Chroma Likeness**, a Marinara Engine personal extension. Re
 - Marinara's chat view caches its messages and won't show messages added through the API until it reloads. `refreshChatView()` finds the React Query client through the React fiber tree and invalidates that chat's queries. If it can't, it fires visibilitychange/focus.
 - In Roleplay, a separate message holding only a picture can get lost if Marinara is still finishing the reply (agents, trackers), so the picture is attached to the reply instead.
 - Contextual mode skips replies that Marinara has already pictured, to avoid double pictures.
+- Contextual photos start by themselves (`autoWatch()`) once keys exist, unless `config.contextOff`. Tests must press the contextual-photos button only when it reads "Enable".
 - Writer models tuned for roleplay sometimes reply in character instead of JSON. `replyJson()` is lenient, and `planPicture()` retries once.
