@@ -250,6 +250,7 @@ async def main():
         state["planner"] = "dare_off"
         await click("Picture the last reply", 4000); print("FORCE:", await out())
         print("PLANNER LOG:", [l for l in state["log"] if l.startswith("PLANNER")])
+        print("LOG:\n" + await page.evaluate("document.querySelector('#chroma-likeness-panel .activity-log').textContent"))
         print("ERRORS:", await page.evaluate("__errors"))
         print("VIEW RELOADS:", await page.evaluate("__inval"))
         await b.close()

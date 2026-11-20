@@ -163,3 +163,4 @@
 #chroma-likeness-wardrobe .outfit-empty { display: grid; place-items: center; height: 150px; font-size: 42px; background: #141217; border-radius: 5px; }
 #chroma-likeness-panel .wardrobe .outfit-tile img { width: 100%; object-fit: contain; background: #141217; }
 #chroma-likeness-wardrobe .extra-hearts img, #chroma-likeness-panel .extra-hearts img { height: 90px; width: auto; max-width: 120px; object-fit: contain; background: #141217; border-radius: 5px; }
+#chroma-likeness-panel .activity-log { max-height: 320px; overflow: auto; margin: 0; padding: 8px; background: #141217; border: 1px solid #4a404d; border-radius: 6px; font: 11.5px/1.45 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; color: #e9dff0; }

@@ -4,7 +4,7 @@ A personal extension for [Marinara Engine](https://github.com/Pasta-Devs/Marinar
 
 Pictures and video come from **SpicyAPI**. Text work (deciding when to take a photo, writing the picture prompt, describing the hearted picture) runs on **NanoGPT** or a SpicyAPI text model.
 
-Current version: **3.0.0**. See [docs/PROJECT-HISTORY.md](docs/PROJECT-HISTORY.md) for every change and the reasons behind it.
+Current version: **3.0.1**. See [docs/PROJECT-HISTORY.md](docs/PROJECT-HISTORY.md) for every change and the reasons behind it.
 
 ## What it does
 
@@ -16,12 +16,13 @@ Current version: **3.0.0**. See [docs/PROJECT-HISTORY.md](docs/PROJECT-HISTORY.m
 - **Settings in Marinara:** keys and settings are kept in Marinara's storage for the extension, so clearing the browser doesn't lose them, and every device gets them. A status line shows what the extension is doing in each chat.
 - **Character folders:** the panel's Characters section shows a thumbnail per character (their hearted reference). Each opens a folder with the reference, editable appearance, sharing, outfits, favourites and every photo of them (♡ heart, 👍/👎 likeness, ☆ favourite, 📸 another, 🎬 animate).
 - **Redo, memory and galleries:** ✎ redoes any picture with an edited prompt and swaps it into the chat. In Chat, each photo comes with a short message from her, and every photo carries what it shows and why, so the character knows what she sent. Every picture is also added to the pictured characters' own Gallery in Marinara.
+- **Activity log:** a panel section listing every step and error, with Copy log, for reporting stalls.
 - **Extras:** photo sets, 📸 "Another" (the next shot in a series), dares, an album of favourites, moving photos (🎬 Animate, can be switched off), and morning and night selfies.
 - **Prompt adaptation:** prompts are built from each model's own input schema, use a negative prompt (or an anatomy hint for models that don't take one), and are worded differently for tag-style and sentence-style models.
 
 ## Install
 
-1. In Marinara, go to Settings → Addons → Personal Extensions and import `releases/Chroma-Likeness-Marinara-3.0.0.zip`. If you're building from source, run `scripts/package.sh` first and import the ZIP it makes.
+1. In Marinara, go to Settings → Addons → Personal Extensions and import `releases/Chroma-Likeness-Marinara-3.0.1.zip`. If you're building from source, run `scripts/package.sh` first and import the ZIP it makes.
 2. Approve it. Marinara asks again after every change to the extension.
 3. Reload the browser tab. The Marinara server doesn't need restarting.
 4. Open the Likeness panel, add your SpicyAPI and NanoGPT keys, and press **Auto-configure**. Turn Illustrator off in your chats; Likeness makes the pictures.

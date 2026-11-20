@@ -134,6 +134,33 @@ async function migrateToServer() {
   if (moved) await flushServer();
   return moved;
 }
+// ---------- Activity log ----------
+// Every step and error, newest last, so a stall or failure can be copied and sent. API keys are blanked.
+// Kept in this browser (last 400 lines) so it survives a reload.
+const logLines = [];
+let logBox = null, logSaveTimer = 0;
+function redact(text) {
+  let out = String(text);
+  for (const k of [config?.spicyKey, config?.nanoKey]) if (k && k.length > 6) out = out.split(k).join("•••");
+  return out.replace(/(Bearer\s+|x-api-key[:=]\s*)[\w.\-]+/gi, "$1•••");
+}
+function logStep(message, level = "info") {
+  logLines.push({ t: Date.now(), level, msg: redact(message).slice(0, 700) });
+  if (logLines.length > 400) logLines.splice(0, logLines.length - 400);
+  if (logBox?.isConnected) paintLog();
+  if (!logSaveTimer) logSaveTimer = marinara.setTimeout(() => { logSaveTimer = 0; localStore("settings", "put", "activityLog", logLines).catch(() => {}); }, 1500);
+}
+function logText() {
+  return logLines.map((l) => new Date(l.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) + (l.level === "error" ? " ✖ " : l.level === "warn" ? " ⚠ " : "   ") + l.msg).join("\n");
+}
+function paintLog() {
+  if (!logBox) return;
+  const atBottom = logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 40;
+  logBox.textContent = logLines.length ? logText() : "Nothing logged yet.";
+  if (atBottom) logBox.scrollTop = logBox.scrollHeight;
+}
+const manifestVersion = "3.0.1";
+const shortChat = (id) => "chat …" + String(id || "").slice(-6);
 async function request(url, opts = {}) {
   let r;
   try {
@@ -146,6 +173,7 @@ async function request(url, opts = {}) {
     if (e?.name === "AbortError") throw e;
     // fetch() only rejects for network failures and CORS refusals; say which host so it is actionable.
     const where = new URL(url, location.href);
+    logStep("Could not reach " + where.host + where.pathname + ": " + (e?.message || e), "error");
     throw Error(
       "Could not reach " + where.host + where.pathname +
         " (" + (e?.message || e) + "). The network is down, the address is wrong, or the provider refused a browser (CORS) request.",
@@ -160,15 +188,11 @@ async function request(url, opts = {}) {
       err = [message, typeof details === "string" ? details : details && JSON.stringify(details)]
         .filter(Boolean).join(" — ");
     } catch {}
-    throw Error(
-      "HTTP " +
-        r.status +
-        (err ? " — " + String(err).slice(0, 750) : "") +
-        " (" +
-        new URL(url, location.href).pathname +
-        ")",
-    );
+    const failure = "HTTP " + r.status + (err ? " — " + String(err).slice(0, 750) : "") + " (" + new URL(url, location.href).pathname + ")";
+    logStep((opts.method || "GET") + " " + new URL(url, location.href).pathname + " failed: " + failure, "error");
+    throw Error(failure);
   }
+  if (opts.method && opts.method !== "GET" && !/recordInfo/.test(url)) logStep(opts.method + " " + new URL(url, location.href).pathname + " → " + r.status);
   return r;
 }
 async function host(path, method = "GET", body) {
@@ -577,10 +601,13 @@ async function spicyImage(prompt, model, ratio, width, height, references, key, 
   })).json());
   const taskId = created?.taskId;
   if (!taskId) throw Error("SpicyAPI did not return a task id.");
+  logStep("SpicyAPI job " + taskId + " started · " + model + " · " + (references?.length || 0) + " reference picture" + ((references?.length || 0) === 1 ? "" : "s"));
+  let loggedState = "";
   const started = Date.now();
   let task = created;
   for (;;) {
     const state = String(task?.state || "").toLowerCase();
+    if (state && state !== loggedState) { loggedState = state; logStep("SpicyAPI job " + taskId + ": " + state + " (" + Math.round((Date.now() - started) / 1000) + "s)", /failed|expired|cancel/.test(state) ? "error" : "info"); }
     const asset = (task?.output?.assets || []).find((a) => a?.url && !a.pending);
     if (state === "succeeded" && asset) {
       let blob;
@@ -590,6 +617,7 @@ async function spicyImage(prompt, model, ratio, width, height, references, key, 
         if (!relayAddress()) throw e;
         blob = await (await request(viaRelay(asset.url), { credentials: "omit" })).blob();
       }
+      logStep("SpicyAPI job " + taskId + ": picture downloaded after " + Math.round((Date.now() - started) / 1000) + "s");
       return { blob, cost: num(task.cost), taskId, mime: asset.mime || blob.type };
     }
     if (/failed|expired|cancel/.test(state))
@@ -1025,6 +1053,7 @@ async function deliver(chat, character, results, pictured, lockFlags = [], conte
   const index = await lockedEntries();
   for (let i = 0; i < results.length; i++) {
     const real = { ...(await upload(chat, results[i])), prompt: results[i].caption || undefined };
+    logStep(shortChat(chat) + ": picture saved to the chat Gallery (" + imgPath(real.url) + ")");
     if (!real.prompt) delete real.prompt;
     if (!lockFlags[i]) { items.push(real); continue; }
     const teaser = await upload(chat, await teaserFrom(results[i].blob));
@@ -1057,7 +1086,7 @@ async function deliver(chat, character, results, pictured, lockFlags = [], conte
 // The upload route is tried and confirmed; if Marinara refuses, the status line and one notice say so.
 let charGalleryRoute = "", charGalleryProblem = "", charGalleryWarned = false;
 async function addToCharacterGalleries(ids, result, path = "") {
-  if (config.charGallery === "off" || !result?.blob) return 0;
+  if (config.charGallery === "off" || !result?.blob || charGalleryRoute === "refused") return 0;
   let added = 0;
   for (const owner of [...new Set(ids.map((id) => String(id).split("~friend~")[0]).filter(Boolean))]) {
     const done = path ? (await store("settings", "get", "copied/" + owner).catch(() => null)) || [] : [];
@@ -1074,6 +1103,7 @@ async function addToCharacterGalleries(ids, result, path = "") {
     }
     if (!ok) {
       charGalleryProblem = last;
+      if (/HTTP 40[45]/.test(last)) charGalleryRoute = "refused"; // no such route here: stop trying until the page reloads
       if (!charGalleryWarned) { charGalleryWarned = true; tell("Could not add pictures to the character’s Gallery in Marinara (" + last + "). They are still in the chat Gallery and the Likeness folder."); }
       return added;
     }
@@ -1429,9 +1459,11 @@ function findViewCache() {
   return null;
 }
 function refreshChatView(id) {
+  let told = false;
   const reload = () => {
     try {
       const cache = findViewCache();
+      if (!told) { told = true; logStep(shortChat(id) + ": asked the chat screen to reload" + (cache ? "" : " (Marinara’s data cache not found; sent the tab-visible signal instead)"), cache ? "info" : "warn"); }
       if (cache) {
         cache.invalidateQueries({ predicate: (q) => { try { return JSON.stringify(q.queryKey).includes(id); } catch { return false; } } });
         return;
@@ -1476,10 +1508,12 @@ async function postMedia(id, character, items, pictured, extra = {}, content = "
     ...(item.mediaType === "video" ? { durationSeconds: item.durationSeconds } : {}),
   }));
   if (!content && (await chatArena(id)) !== "conversation") {
-    if (await attachToLatest(id, attachments, { chromaLikeness: true, likenessCast: pictured, ...extra }).catch(() => false)) {
+    if (await attachToLatest(id, attachments, { chromaLikeness: true, likenessCast: pictured, ...extra }).catch((e) => { logStep("Attaching to the reply failed: " + e.message, "warn"); return false; })) {
+      logStep(shortChat(id) + ": picture attached to the latest message");
       refreshChatView(id);
       return;
     }
+    logStep(shortChat(id) + ": could not attach to the latest message, posting it as its own message instead", "warn");
   }
   await host("/chats/" + enc(id) + "/messages", "POST", {
     role: "assistant",
@@ -1492,6 +1526,7 @@ async function postMedia(id, character, items, pictured, extra = {}, content = "
       ...extra,
     },
   });
+  logStep(shortChat(id) + ": photo message posted" + (content ? " with her text" : ""));
   refreshChatView(id);
 }
 let mirrorOut = null;
@@ -1501,6 +1536,7 @@ function note(s) {
   output.textContent = s;
 }
 function fail(e) {
+  logStep(e?.message || String(e), "error");
   if (alive) note(e.message || String(e));
 }
 async function action(fn) {
@@ -2121,6 +2157,7 @@ function takesPhoto(text) {
 const photoWords = /\b(photo|picture|pic|pics|selfie|snap|snaps|snapped|shot|camera|film|filming|record|polaroid|nudes?)\b|📸|📷/i;
 // Contextual results reach you even with the panel closed.
 function tell(message) {
+  logStep(message);
   note(message);
   if (!panel.open) toastResult(message);
 }
@@ -2213,6 +2250,7 @@ async function pollContext(w, chat = chat, force = false) {
     // Marinara's own selfie or Illustrator already pictured this reply: do not add a second one.
     if (parse(latest.extra,{})?.attachments?.some(a=>a.type==="image")) { lastTurns.set(chat, latest.id); setStatus(chat, "That reply already had a picture from Marinara (Illustrator), so Likeness left it."); return; }
     const job="context/"+chat+"/"+latest.id;
+    logStep(shortChat(chat) + ": new " + latest.role + " reply " + latest.id + " · checking whether to picture it");
     try { await store("jobs","add",job,{status:"checking"}); }
     catch(e){if(e.name!=="ConstraintError")throw e; lastTurns.set(chat, latest.id); return;}
     lastTurns.set(chat, latest.id);
@@ -2224,7 +2262,9 @@ async function pollContext(w, chat = chat, force = false) {
   const photoTaken=takesPhoto(latest.content) || Boolean(lastUser && turns.indexOf(lastUser)>=turns.length-3 && takesPhoto(lastUser.content));
   const roster=await chatCast(chat);
   const state=await sceneState(chat);
+  logStep(shortChat(chat) + ": asking " + (modelFor("writer") || "the writing model") + " what to picture" + (photoTaken ? " (a photo is being taken in the story)" : "") + (userAsked ? " (you asked for a photo)" : ""));
   let plan=await planPicture(turns,roster,state,chat,force,photoTaken);
+  logStep(shortChat(chat) + ": decision · " + (plan?.people?.length ? "picture " + plan.people.map(c=>c.name).join(" + ") + (plan.unprompted ? " (unprompted)" : "") + " · " + String(plan.scene || "").slice(0, 160) : plan?.raw===null ? "unreadable answer" : "no picture"));
   // A photo was taken but the writer pictured nobody: ask once more, this time insisting.
   if (plan && photoTaken && !force && !plan.people.length && plan.raw!==null && alive) plan=await planPicture(turns,roster,state,chat,true,true);
   if (!plan || (!force && watch!==w) || !alive) return;
@@ -2250,7 +2290,7 @@ async function pollContext(w, chat = chat, force = false) {
   }
   const stillCurrent=async()=>force || (alive && watch===w && (await store("settings","get","watch"))?.session===w.session &&
     (await recentTurns(chat)).at(-1)?.id===latest.id);
-  if (!await stillCurrent()) return;
+  if (!await stillCurrent()) { setStatus(chat, "No picture: the chat moved on (a newer message arrived) before the picture was started."); return; }
   // A dare in the chat gets a photo set as her answer.
   if (plan.dare && config.dares !== "off") {
     const dareText = [...turns].reverse().find((t) => t.role === "user")?.content || plan.scene;
@@ -2999,6 +3039,32 @@ async function openRedo(row, who = "") {
   outfitBox.replaceChildren(head, body);
   if (!outfitBox.open) outfitBox.showModal();
 }
+{
+  const logSection = section("Activity log");
+  logSection.append(node("small", "Every step and error, newest at the bottom. If pictures stall or fail, tap Copy log and send it. API keys are never shown here."));
+  logBox = node("pre", undefined, "activity-log");
+  logSection.append(logBox);
+  const logButtons = node("div", undefined, "actions");
+  logSection.append(logButtons);
+  button(logButtons, "Copy log", async () => {
+    const text = "Chroma Likeness " + (manifestVersion || "") + " · " + new Date().toString() + "\n" + logText();
+    try { await navigator.clipboard.writeText(text); note("Log copied."); return; } catch {}
+    const ta = node("textarea");
+    ta.value = text;
+    ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.append(ta);
+    ta.select();
+    const ok = document.execCommand && document.execCommand("copy");
+    ta.remove();
+    if (ok) { note("Log copied."); return; }
+    const range = document.createRange();
+    range.selectNodeContents(logBox);
+    getSelection().removeAllRanges(); getSelection().addRange(range);
+    note("Your browser blocked copying: the log is selected, so use your browser’s Copy.");
+  });
+  button(logButtons, "Clear log", async () => { logLines.length = 0; paintLog(); await localStore("settings", "put", "activityLog", []); note("Log cleared."); });
+  paintLog();
+}
 function openPanel() {
   if (!panel.open) panel.showModal();
 }
@@ -3440,6 +3506,7 @@ let lastPollError = "", pollChat = "", warnedMissing = "";
 const chatStatus = new Map();
 function setStatus(chat, text) {
   if (!chat) return;
+  logStep(shortChat(chat) + ": " + text, /^(Error|Paused)/.test(text) ? "error" : /^No picture|moved on/.test(text) ? "warn" : "info");
   chatStatus.set(chat, { text, at: Date.now() });
   if (panel.open && chat === chatId) paintArena().catch(() => {});
 }
@@ -3696,6 +3763,8 @@ marinara.onCleanup(() => {
   dbPromise.then((db) => db.close()).catch(() => {});
 });
 try {
+  try { const saved = await localStore("settings", "get", "activityLog"); if (Array.isArray(saved)) logLines.unshift(...saved.slice(-400)); } catch {}
+  logStep("Chroma Likeness " + (manifestVersion || "") + " started");
   await loadServer();
   await migrateToServer().catch(() => 0);
   config = (await store("settings", "get", "config")) || {};

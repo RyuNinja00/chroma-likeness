@@ -32,11 +32,15 @@ You are picking up **Chroma Likeness**, a Marinara Engine personal extension. Re
 
 ## Conventions
 
-- Bump `manifest.json`'s version for every user-visible change, and add a row to `docs/PROJECT-HISTORY.md` (problem, cause, fix) and update its version line.
+- Bump `manifest.json`'s version (and `manifestVersion` in extension.js, shown in the Activity log) for every user-visible change, and add a row to `docs/PROJECT-HISTORY.md` (problem, cause, fix) and update its version line.
 - Keep a full copy of the previous `extension.js` before a big edit. Check it still parses: `node -e "new (Object.getPrototypeOf(async function(){}).constructor)('marinara', require('fs').readFileSync('extension/Chroma Likeness/extension.js','utf8'))"`.
 - Avoid straight apostrophes inside single-quoted JS strings; the code uses ’. Write messages the user sees in plain words.
 - Run all tests (see `tests/README.md`: four browser tests and `test_prompts.js`) before packaging. Package with `scripts/package.sh`, which builds `releases/Chroma-Likeness-Marinara-<version>.zip` with the `Chroma Likeness/` folder at the root.
 - After installing a new ZIP, the user must re-approve the extension and reload the tab.
+
+## Debugging with the user
+
+- The panel's **Activity log** (`logStep()`) records each step: reply noticed, writer decision, SpicyAPI job states, gallery save, attach/post, chat-view reload, and failed requests. Ask the user to tap Copy log and paste it. Add `logStep()` calls for any new step.
 
 ## Known gotchas
 
