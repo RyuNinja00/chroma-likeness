@@ -183,7 +183,7 @@ async def main():
         async def click(t, wait=1500):
             await btn(t).first.click(); await page.wait_for_timeout(wait)
         await page.click("#chroma-likeness-launch"); await page.wait_for_timeout(800)
-        await inp("SpicyAPI key").fill("spicy-test-key"); await inp("NanoGPT key").fill("nano-test-key")
+        await inp("API key for the picture provider").fill("spicy-test-key"); await inp("NanoGPT key").fill("nano-test-key")
         await click("Save settings", 3000)
         print("AFTER SAVE (auto-config):", await out())
         print("PICKS:", {t: await sel(t).input_value() for t in ["generation model", "reference editing", "Writing model", "Vision model", "Video model"]})

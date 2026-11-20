@@ -20,7 +20,7 @@ const MAX_BYTES = 40 * 1024 * 1024;
 // For local testing only: send *.spicyapi.ai traffic to another origin.
 const REWRITE = process.env.RELAY_TEST_REWRITE || "";
 
-const allowedHosts = new Set(["api.spicyapi.ai", "api.nano-gpt.com"]);
+const allowedHosts = new Set(["api.spicyapi.ai", "api.nano-gpt.com", "api.runware.ai", "im.runware.ai"]);
 const isSpicy = (host) => host === "spicyapi.ai" || host.endsWith(".spicyapi.ai");
 const isNano = (host) => host === "nano-gpt.com" || host.endsWith(".nano-gpt.com");
 

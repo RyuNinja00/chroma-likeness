@@ -60,6 +60,17 @@ def j(route, data, status=200):
     return route.fulfill(status=status, content_type="application/json", body=json.dumps(data), headers={"access-control-allow-origin": "*"})
 
 async def handle(route):
+    if route.request.url.startswith("https://api.runware.ai/v1"):
+        body = json.loads(route.request.post_data or "[]")
+        state["runware_auth"] = route.request.headers.get("authorization", "")
+        task = body[0] if body else {}
+        if task.get("taskType") == "authentication":
+            return await route.fulfill(status=200, content_type="application/json", body=json.dumps({"data": [{"taskType": "authentication", "connectionSessionUUID": "s1"}]}))
+        refs = len((task.get("inputs") or {}).get("referenceImages") or [])
+        state["log"].append("RUNWARE model=%s refs=%d size=%s neg=%s" % (task.get("model"), refs, "%sx%s" % (task.get("width"), task.get("height")) if "width" in task else "none", "negativePrompt" in task))
+        if refs and "width" in task:
+            return await route.fulfill(status=400, content_type="application/json", body=json.dumps({"errors": [{"code": "unsupportedParameter", "message": "width and height cannot be used together with referenceImages", "parameter": "width", "taskUUID": task.get("taskUUID")}]}))
+        return await route.fulfill(status=200, content_type="application/json", body=json.dumps({"data": [{"taskType": "imageInference", "taskUUID": task.get("taskUUID"), "imageUUID": "u1", "imageDataURI": "data:image/png;base64," + base64.b64encode(RESULT).decode(), "cost": 0.03}]}))
     req, url = route.request, route.request.url
     if url.startswith("http://localhost:7860/__storage"):
         if req.method == "POST":
@@ -256,7 +267,7 @@ async def main():
         ctx, page = await open_page(b)
         L = lambda sel, t: page.locator("#chroma-likeness-panel " + sel, has_text=t)
         await page.click("#chroma-likeness-launch"); await page.wait_for_timeout(800)
-        await L("label", "SpicyAPI key").locator("input").fill("spicy-test-key"); await L("label", "NanoGPT key").locator("input").fill("nano-test-key")
+        await L("label", "API key for the picture provider").locator("input").fill("spicy-test-key"); await L("label", "NanoGPT key").locator("input").fill("nano-test-key")
         await L("button", "Save settings").first.click(); await page.wait_for_timeout(3000)
         cfg = state["storage"].get("config", {})
         print("1 STORED IN MARINARA:", {k: cfg.get(k) for k in ("spicyKey", "nanoKey")}, "| auto-watch button:", await L("button", "contextual photos").first.inner_text())
@@ -266,7 +277,7 @@ async def main():
         ctx, page = await open_page(b)
         L = lambda sel, t: page.locator("#chroma-likeness-panel " + sel, has_text=t)
         await page.click("#chroma-likeness-launch"); await page.wait_for_timeout(1500)
-        print("2 FRESH BROWSER key field:", await L("label", "SpicyAPI key").locator("input").input_value(), "| button:", await L("button", "contextual photos").first.inner_text())
+        print("2 FRESH BROWSER key field:", await L("label", "API key for the picture provider").locator("input").input_value(), "| button:", await L("button", "contextual photos").first.inner_text())
         print("2 STATUS:", (await page.locator("#chroma-likeness-panel small", has_text="Status:").first.inner_text()).replace("\n", " || "))
         await page.evaluate("document.querySelectorAll('#chroma-likeness-panel details').forEach(d => d.open = true)")
         state["storage"]["config"]["heat"] = "explicit"
@@ -367,6 +378,31 @@ async def main():
         print("6 RETURN toasts:", await toasts(page, 7))
         print("6 PHOTO IN CHAT:", [l for l in state["log"] if l.startswith("c1 POSTED")][-1:])
         print("6 OUTFIT BACK IN CHAT:", state["storage"].get("state/c1", {}).get("outfits", {}).get("ch1", "")[:40])
+        # 8. Runware as the picture provider: paired keys, its models and limits, a real request
+        await page.click("#chroma-likeness-launch"); await page.wait_for_timeout(1000)
+        await page.evaluate("document.querySelectorAll('#chroma-likeness-panel details').forEach(d => d.open = true)")
+        prov = page.locator("#chroma-likeness-panel label", has_text="Picture provider").locator("select")
+        key = page.locator("#chroma-likeness-panel label", has_text="API key for the picture provider").locator("input")
+        await prov.select_option("runware"); await page.wait_for_timeout(300)
+        print("8 KEY BOX on Runware:", repr(await key.input_value()), "| placeholder:", await key.get_attribute("placeholder"))
+        await key.fill("rw-test-key")
+        await prov.select_option("spicyapi"); await page.wait_for_timeout(200)
+        print("8 KEY BOX back on SpicyAPI:", await key.input_value())
+        await prov.select_option("runware"); await page.wait_for_timeout(300)
+        print("8 KEY BOX on Runware again:", await key.input_value())
+        edit_sel = page.locator("#chroma-likeness-panel .model-picker", has_text="Hearted pictures").locator("select")
+        print("8 EDIT MODEL:", await edit_sel.input_value(), "| hint:", (await page.locator("#chroma-likeness-panel .model-picker", has_text="Hearted pictures").locator("small").inner_text())[:110])
+        print("8 GEN OPTIONS:", [o for o in await page.locator("#chroma-likeness-panel .model-picker", has_text="New pictures").locator("option").all_inner_texts()][:4])
+        await page.locator("#chroma-likeness-panel button", has_text="Save settings").first.click(); await page.wait_for_timeout(1500)
+        cfg = state["storage"].get("config", {})
+        print("8 SAVED:", {k: cfg.get(k) for k in ("imageProvider", "spicyKey", "runwareKey")}, "| runware models:", cfg.get("runwareModels"))
+        await page.locator("#chroma-likeness-panel button", has_text="Check connection").first.click(); await page.wait_for_timeout(2500)
+        print("8 CHECK:", [l for l in (await page.evaluate("document.querySelector('#chroma-likeness-panel output').textContent")).split("\n") if "Runware" in l], "| auth header:", state.get("runware_auth"))
+        await page.locator("#chroma-likeness-panel label", has_text="Scene or image prompt").locator("textarea").fill("Alex on a rooftop at dusk")
+        await page.locator("#chroma-likeness-panel button", has_text="Generate and post").first.click(); await page.wait_for_timeout(4000)
+        print("8 RUNWARE REQUESTS:", [l for l in state["log"] if l.startswith("RUNWARE")])
+        print("8 POSTED:", [l for l in state["log"] if "POSTED" in l][-1:])
+        await page.locator("#chroma-likeness-panel button", has_text="Close").first.click(); await page.wait_for_timeout(300)
         # 7. Status line for the chat selected in the panel
         await page.click("#chroma-likeness-launch"); await page.wait_for_timeout(1500)
         await page.set_viewport_size({"width": 420, "height": 900}); await page.wait_for_timeout(300)

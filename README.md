@@ -2,9 +2,9 @@
 
 A personal extension for [Marinara Engine](https://github.com/Pasta-Devs/Marinara-Engine). It keeps a character looking like themselves in every picture. You "heart" a picture that looks right, rate later pictures 👍/👎, and the extension uses the heart as the reference while pose, place, outfit and mood change.
 
-Pictures and video come from **SpicyAPI**. Text work (deciding when to take a photo, writing the picture prompt, describing the hearted picture) runs on **NanoGPT** or a SpicyAPI text model.
+Pictures come from **SpicyAPI** or **Runware** (picked in Settings, each with its own key); moving photos use SpicyAPI. Text work (deciding when to take a photo, writing the picture prompt, describing the hearted picture) runs on **NanoGPT** or a SpicyAPI text model.
 
-Current version: **3.0.1**. See [docs/PROJECT-HISTORY.md](docs/PROJECT-HISTORY.md) for every change and the reasons behind it.
+Current version: **3.1.0**. See [docs/PROJECT-HISTORY.md](docs/PROJECT-HISTORY.md) for every change and the reasons behind it.
 
 ## What it does
 
@@ -22,7 +22,7 @@ Current version: **3.0.1**. See [docs/PROJECT-HISTORY.md](docs/PROJECT-HISTORY.m
 
 ## Install
 
-1. In Marinara, go to Settings → Addons → Personal Extensions and import `releases/Chroma-Likeness-Marinara-3.0.1.zip`. If you're building from source, run `scripts/package.sh` first and import the ZIP it makes.
+1. In Marinara, go to Settings → Addons → Personal Extensions and import `releases/Chroma-Likeness-Marinara-3.1.0.zip`. If you're building from source, run `scripts/package.sh` first and import the ZIP it makes.
 2. Approve it. Marinara asks again after every change to the extension.
 3. Reload the browser tab. The Marinara server doesn't need restarting.
 4. Open the Likeness panel, add your SpicyAPI and NanoGPT keys, and press **Auto-configure**. Turn Illustrator off in your chats; Likeness makes the pictures.

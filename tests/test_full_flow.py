@@ -208,7 +208,7 @@ async def main():
         print("INIT:", await out())
         labels = [await page.locator("#chroma-likeness-panel label").nth(i).inner_text() for i in range(await page.locator("#chroma-likeness-panel label").count())]
         print("LABELS:", [l.split("\n")[0] for l in labels][:12])
-        await inp("SpicyAPI key").fill("spicy-test-key")
+        await inp("API key for the picture provider").fill("spicy-test-key")
         await click("Refresh model lists")
         for t in ["generation model", "reference editing model", "Writing model", "Vision model"]:
             print(t, "->", await sel(t).evaluate("s => [...s.querySelectorAll('optgroup')].map(g => g.label + ': ' + [...g.children].map(o => o.value + (o.selected?'*':'')).join(', '))"))

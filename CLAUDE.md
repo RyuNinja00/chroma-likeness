@@ -5,7 +5,7 @@ You are picking up **Chroma Likeness**, a Marinara Engine personal extension. Re
 ## The user
 
 - Uses Marinara Engine, mostly on a phone. Chats in both Conversation and Roleplay modes, including scene chats that Marinara creates from an invite in a Conversation.
-- Uses NanoGPT as their main text model provider and SpicyAPI for pictures and video. Sogni was tried and dropped because the browser blocked it (CORS). Remove other providers rather than adding them back.
+- Uses NanoGPT as their main text model provider. Pictures come from SpicyAPI or Runware (the "Picture provider" setting); video stays on SpicyAPI. Sogni was tried and dropped because the browser blocked it (CORS). Remove other providers rather than adding them back.
 - Adult, uncensored use. Keep the adults-only anchor in every picture prompt.
 - Has turned Marinara's Illustrator off in Chat and Roleplay: Likeness must make every picture itself. Don't rely on Illustrator, selfies or Marinara image connections.
 - Wants things to work automatically: settings worked out from context, prompting that adapts to the model and chat type. Tests the extension live and reports what they see, often briefly ("no picture was produced"). Diagnose the cause from the code before changing it.
@@ -17,6 +17,7 @@ You are picking up **Chroma Likeness**, a Marinara Engine personal extension. Re
   - `marinara.storage` (Marinara's per-extension storage) holds `config` (keys too), `lockedIndex`, `links`, and `state/`, `album/`, `lastScene/`, `link/` and `photos/` (each person's filed photos) entries. `store()` writes these through to it (debounced `patch`) and reads them from it first.
   - IndexedDB `marinara-chroma-likeness-v1` is a local cache, plus per-browser things: `jobs`, `watch`, references.
   - Card extensions on the character (`chromaLikeness…` keys) hold what should travel with the card: the heart, its traits, the closet.
+- Picture providers: `imageProvider()` (`config.imageProvider`), `imageKey()`, `runwareKey()`. Gen and edit roles route through `providerOf()`/`catFor()` to `catalog` (SpicyAPI, schema-driven) or `runwareCatalog` (built-in `runwareKnown` list with reference limits). `render()` calls `runwareImage()` or `spicyImage()`. Runware models are saved in `config.runwareModels`; SpicyAPI's in `config.models`.
 - Model catalogues: SpicyAPI `/api/v1/models?includeSchema=1` (inputs are built from each model's schema, because unknown fields return a 400) and NanoGPT `/api/v1/models?detailed=true` (vision, structured output and reasoning flags).
 - Main flows:
   - `render()`: generates or edits a picture via `spicyImage()`.

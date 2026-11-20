@@ -22,10 +22,14 @@ const adultAnchor="All people shown are adults.";
 function modelMeta(m){return catalog.meta.get(m)} function savedModel(){return "seedream"} function imageKey(){return "k"} function wantsTags(){return false}
 function withoutSelfieNote(x){return x}
 async function modelSchema(){}
+function imageProvider(){return globalThis.PROV||"spicyapi"}
+async function runwareImage(...a){globalThis.RUNWARE_CALLS=(globalThis.RUNWARE_CALLS||0)+1;return spicyImage(...a)}
 async function spicyImage(prompt,model,ratio,w,h,refs){sent={prompt,refs};return {blob:new Blob([new Uint8Array([137,80,78,71,0,0,0,0,0,0,0,0])],{type:"image/png"}),cost:0}}
 `;
-eval(env + line("const hairWear") + line("const identityWords") + grab("function referenceEditPrompt") + grab("function refCapacity") + grab("function soloPlan") + grab("function capacityText") +
+const span = (a, b) => s.slice(s.indexOf(a), s.indexOf(b));
+eval(env + span("const runwareKnown", "function isRunwareConnection") + line("const hairWear") + line("const identityWords") + grab("function referenceEditPrompt") + grab("function refCapacity") + grab("function soloPlan") + grab("function capacityText") +
   grab("async function render(") + grab("async function outfitReference") + ";globalThis.R=render;globalThis.E=referenceEditPrompt;globalThis.O=outfitReference;globalThis.C=capacityText;globalThis.K=refCapacity;");
+const RW = { meta: (m) => eval("runwareCatalog").meta.get(m) };
 const pic = (t) => new Blob([t]);
 const tag = (b) => b && b.size ? b.text() : "";
 (async () => {
@@ -77,6 +81,21 @@ const tag = (b) => b && b.size ? b.text() : "";
   check("outfit reference avoids likeness 👎, prefers 👍", (await O("ch1", { key: "k", picture: "/p/a", pictures: ["/p/c", "/p/b", "/p/a"] }, likes)) === "/p/b");
   check("outfit reference skips outfit 👎", (await O("ch1", { key: "k", picture: "/p/c", pictures: ["/p/c", "/p/d"], votes: { "/p/c": "down" } }, {})) === "/p/d");
   check("outfit reference chosen with ♡ stays", (await O("ch1", { key: "k", picture: "/p/a", pictureChosen: true, pictures: ["/p/a", "/p/b"] }, likes)) === "/p/a");
+  // Runware: limits come from Likeness’s list of Runware models; unknown ids get 1 to be safe.
+  globalThis.PROV = "runware";
+  check("runware seedream 5.0 pro limit", K("bytedance:seedream@5.0-pro").max === 10 && K("bytedance:seedream@5.0-pro").stated);
+  check("runware qwen edit takes 1", K("runware:108@20").max === 1);
+  check("runware text-only model takes none", K("runware:101@1").max === 0, C("runware:101@1"));
+  check("unknown runware id plays safe", K("civitai:1@1").max === 1 && !K("civitai:1@1").stated, C("civitai:1@1"));
+  catalog.meta.set("bytedance:seedream@5.0-pro", { edit: true });
+  await R("Alex at the gala", pic("main"), "3:4", undefined, "bytedance:seedream@5.0-pro", "", null, false, "", outfit, [pic("x1"), pic("x2")]);
+  check("runware seedream sends main, 2 extras, outfit via Runware", sent.refs.length === 4 && globalThis.RUNWARE_CALLS === 1);
+  await R("Alex at the gala", pic("main"), "3:4", undefined, "runware:108@20", "", null, false, "", outfit, [pic("x1"), pic("x2")]);
+  check("runware qwen edit sends only the main heart", sent.refs.length === 1);
+  let rwRefused = "";
+  try { await R("Alex", pic("main"), "3:4", undefined, "runware:101@1", "", null, false, "", null, []); } catch (err) { rwRefused = err.message; }
+  check("runware text-only model refuses a reference", /does not take reference pictures/.test(rwRefused), rwRefused);
+  globalThis.PROV = "spicyapi";
   console.log(fails ? fails + " FAILED" : "ALL PASSED");
   process.exit(fails ? 1 : 0);
 })().catch((err) => { console.log("ERR", err); process.exit(1); });

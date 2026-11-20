@@ -38,6 +38,13 @@ Send the headers `x-marinara-csrf: 1` and `X-Admin-Secret` (taken from localStor
   - Editing: `bytedance/seedream-5.0-pro/edit` (up to 10 references), with `alibaba/qwen-image-spicy-edit/edit` as an alternative.
   - Video: `alibaba/wan-2.2-spicy/image-to-video`.
 
+## Runware
+
+- POST `https://api.runware.ai/v1` with header `Authorization: Bearer <key>` and a JSON array of tasks. `{taskType:"authentication", apiKey}` checks the key.
+- Pictures: `{taskType:"imageInference", taskUUID:<uuid v4>, model:<AIR id>, positivePrompt, width, height, numberResults:1, outputType:"dataURI", outputFormat:"JPG", includeCost:true, inputs:{referenceImages:[data URIs]}}`. The response's `data[]` has `imageDataURI` (or `imageURL`) and `cost`; errors come in `errors[]` with `message` and `parameter`.
+- Reference limits are per model (Seedream 5.0 Pro 10, Seedream 4.5 14, Qwen-Image-Edit-Plus 3, Qwen-Image-Edit 1). Some models refuse width/height together with references; the extension then resends without them.
+- Partner-hosted models (Seedream, Qwen) may apply their provider's content rules.
+
 ## NanoGPT
 
 - Chat: `https://api.nano-gpt.com/api/v1/chat/completions`.

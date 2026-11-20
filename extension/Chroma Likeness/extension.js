@@ -159,7 +159,7 @@ function paintLog() {
   logBox.textContent = logLines.length ? logText() : "Nothing logged yet.";
   if (atBottom) logBox.scrollTop = logBox.scrollHeight;
 }
-const manifestVersion = "3.0.1";
+const manifestVersion = "3.1.0";
 const shortChat = (id) => "chat …" + String(id || "").slice(-6);
 async function request(url, opts = {}) {
   let r;
@@ -235,12 +235,43 @@ const spicyRoles = new Set(["gen", "edit", "video"]); // always SpicyAPI
 function spicyKey() {
   return config.spicyKey || "";
 }
-function imageKey() {
-  return spicyKey();
+// ---------- Picture providers ----------
+// Pictures come from the provider picked in Settings: SpicyAPI or Runware. Each keeps its own key and models.
+// Moving photos (🎬) always use SpicyAPI, so its key is kept even when Runware makes the pictures.
+const imageProviderNames = { spicyapi: "SpicyAPI", runware: "Runware" };
+let imageProviderOverride = null; // the provider shown in Settings before it is saved
+function imageProvider() {
+  return imageProviderOverride || config.imageProvider || "spicyapi";
+}
+function runwareKey() {
+  return config.runwareKey || "";
+}
+function imageKey(provider = imageProvider()) {
+  return provider === "runware" ? runwareKey() : spicyKey();
+}
+// Runware models Likeness knows, with how many reference pictures each takes (from Runware's model pages).
+const runwareKnown = [
+  ["bytedance:seedream@5.0-pro", "Seedream 5.0 Pro · ≤10 refs", { gen: true, edit: true, maxInputs: 10 }],
+  ["bytedance:seedream@4.5", "Seedream 4.5 · ≤14 refs", { gen: true, edit: true, maxInputs: 14 }],
+  ["runware:108@22", "Qwen-Image-Edit-Plus · ≤3 refs", { gen: false, edit: true, maxInputs: 3 }],
+  ["runware:108@20", "Qwen-Image-Edit · 1 ref", { gen: false, edit: true, maxInputs: 1 }],
+  ["runware:101@1", "FLUX.1 [dev] · text only", { gen: true, edit: false, maxInputs: 0 }],
+  ["runware:100@1", "FLUX.1 [schnell] · fast, text only", { gen: true, edit: false, maxInputs: 0 }],
+  ["runware:108@1", "Qwen-Image · text only", { gen: true, edit: false, maxInputs: 0 }],
+];
+const runwareDefaults = { gen: "runware:101@1", edit: "bytedance:seedream@5.0-pro" };
+const runwareCatalog = {
+  ready: true, error: "", schemas: new Map(), live: new Set(),
+  meta: new Map(runwareKnown.map(([id, name, info]) => [id, { ...info, name }])),
+  lists: { gen: runwareKnown.filter(([, , i]) => i.gen).map(([id, t]) => [id, t]), edit: runwareKnown.filter(([, , i]) => i.edit).map(([id, t]) => [id, t]) },
+};
+function isRunwareConnection(c) {
+  return /runware/.test([c.provider, c.imageGenerationSource, c.imageSource, c.imageService, c.source, c.service, c.baseUrl, c.endpoint, c.url]
+    .filter((v) => typeof v === "string").join(" ").toLowerCase());
 }
 // Writing and vision can run on NanoGPT (default) or SpicyAPI; pictures always use SpicyAPI.
 const nanoApi = "https://api.nano-gpt.com";
-const textProviderNames = { nanogpt: "NanoGPT", spicyapi: "SpicyAPI" };
+const textProviderNames = { nanogpt: "NanoGPT", spicyapi: "SpicyAPI", runware: "Runware" };
 let textProviderOverride = null; // the provider shown in Settings before it is saved
 function textProvider() {
   return textProviderOverride || config.textProvider || "nanogpt";
@@ -249,14 +280,15 @@ function textKey(provider = textProvider()) {
   return provider === "nanogpt" ? config.nanoKey || "" : spicyKey();
 }
 function providerOf(role) {
-  return spicyRoles.has(role) ? "spicyapi" : textProvider();
+  return imageRoles.has(role) ? imageProvider() : role === "video" ? "spicyapi" : textProvider();
 }
 function providerName(role) {
   return textProviderNames[providerOf(role)];
 }
 const nanoCatalog = { ready: false, meta: new Map(), lists: { writer: [], vision: [] }, error: "", visionKnown: true };
 function catFor(role) {
-  return providerOf(role) === "nanogpt" ? nanoCatalog : catalog;
+  const provider = providerOf(role);
+  return provider === "nanogpt" ? nanoCatalog : provider === "runware" ? runwareCatalog : catalog;
 }
 function isNanoConnection(c) {
   return /nano-?gpt/.test([c.provider, c.source, c.service, c.baseUrl, c.endpoint, c.url]
@@ -311,7 +343,7 @@ function connModels(c) {
 // Models picked in your Marinara connections for this role's provider (SpicyAPI or NanoGPT).
 function marinaraModels(role) {
   const kind = role === "video" ? "video" : imageRoles.has(role) ? "image" : "text", out = new Map();
-  const matches = providerOf(role) === "nanogpt" ? isNanoConnection : isSpicyConnection;
+  const matches = providerOf(role) === "nanogpt" ? isNanoConnection : providerOf(role) === "runware" ? isRunwareConnection : isSpicyConnection;
   for (const c of connections) {
     if (!c || !matches(c) || connKind(c) !== kind) continue;
     for (const m of connModels(c)) {
@@ -325,9 +357,11 @@ function marinaraModels(role) {
   return [...out];
 }
 function modelFor(role, ignoreSaved = false) {
-  const saved = ignoreSaved ? undefined : spicyRoles.has(role) ? config.models?.[role] : config.textModels?.[textProvider()]?.[role];
+  const onRunware = imageRoles.has(role) && imageProvider() === "runware";
+  const saved = ignoreSaved ? undefined : onRunware ? config.runwareModels?.[role] : spicyRoles.has(role) ? config.models?.[role] : config.textModels?.[textProvider()]?.[role];
   if (saved !== undefined && saved !== null && (saved || role === "vision" || role === "video")) return saved;
   const cat = catFor(role);
+  if (onRunware) return marinaraModels(role).find(([id]) => cat.meta.has(id))?.[0] || runwareDefaults[role];
   if (role === "video") return cat.lists.video?.find(([id]) => /spicy/i.test(id))?.[0] || cat.lists.video?.[0]?.[0] || (offered(defaultModels.video) ? defaultModels.video : "");
   return (
     marinaraModels(role).find(([id]) => !imageRoles.has(role) || cat.meta.has(id))?.[0] ||
@@ -492,6 +526,10 @@ function negativePrompt() {
 // When the model does not say, play safe: 2 for a list of pictures, 1 for a single picture field.
 // Before its rules are loaded, only what is known for sure (else 1).
 function refCapacity(model) {
+  if (imageProvider() === "runware") {
+    const known = runwareCatalog.meta.get(model);
+    return known ? { max: known.maxInputs || 0, stated: true } : { max: 1, stated: false };
+  }
   const meta = catalog.meta.get(model) || {};
   const props = catalog.schemas.get(model)?.properties || {}, names = Object.keys(props);
   const many = names.find((n) => props[n]?.type === "array" && /image|ref/i.test(n) && !/mask/i.test(n));
@@ -589,6 +627,63 @@ async function spicyUpload(blob, key) {
   } catch (e) {
     if (bytes.size <= 900 * 1024) return "data:" + mime + ";base64," + img.bytes;
     throw Error("Could not upload the reference picture to SpicyAPI: " + e.message);
+  }
+}
+// Runware: one POST with an array of tasks; the picture comes back in the same response (as a data URI,
+// so no second download that a browser could block). Reference pictures go in inputs.referenceImages.
+// If Runware rejects an optional setting for a model (size, negative prompt), it is dropped and sent again.
+const runwareApi = "https://api.runware.ai/v1";
+function uuid4() {
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 15) | 64; b[8] = (b[8] & 63) | 128;
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return h.slice(0, 8) + "-" + h.slice(8, 12) + "-" + h.slice(12, 16) + "-" + h.slice(16, 20) + "-" + h.slice(20);
+}
+function dataUriBlob(uri) {
+  const [head, body] = String(uri).split(",", 2);
+  const mime = /data:([^;]+)/.exec(head)?.[1] || "image/png";
+  return new Blob([Uint8Array.from(atob(body || ""), (c) => c.charCodeAt(0))], { type: mime });
+}
+async function runwareImage(prompt, model, ratio, width, height, references, key, timeoutMs = 360000) {
+  if (!key) throw Error("Enter your Runware key in Settings.");
+  const meta = runwareCatalog.meta.get(model) || {};
+  const task = {
+    taskType: "imageInference", taskUUID: uuid4(), model, positivePrompt: String(prompt).slice(0, 2900),
+    width, height, numberResults: 1, outputType: "dataURI", outputFormat: "JPG", includeCost: true,
+  };
+  if (meta.neg) task.negativePrompt = (config.negative === undefined ? defaultNegative : config.negative) || undefined;
+  else if (!/two hands/.test(task.positivePrompt)) task.positivePrompt = (task.positivePrompt + anatomyHint).slice(0, 2900);
+  if (references?.length) task.inputs = { referenceImages: await Promise.all(references.map(async (r) => { const x = await portableImage(r); return "data:" + x.mime + ";base64," + x.bytes; })) };
+  const started = Date.now();
+  logStep("Runware job " + task.taskUUID.slice(0, 8) + " started · " + model + " · " + (references?.length || 0) + " reference picture" + ((references?.length || 0) === 1 ? "" : "s"));
+  const send = (url) => request(url, { method: "POST", credentials: "omit", headers: { "Content-Type": "application/json", Authorization: "Bearer " + key }, body: JSON.stringify([task]) });
+  for (let attempt = 0; ; attempt++) {
+    let json;
+    try {
+      const r = await send(runwareApi).catch((e) => { if (relayAddress() && /Could not reach/.test(e.message)) return send(viaRelay(runwareApi)); throw e; });
+      json = await r.json();
+    } catch (e) {
+      // An optional setting this model does not take: drop it and try again (at most twice).
+      const drop = ["negativePrompt", "outputFormat", "width", "height"].find((k) => k in task && new RegExp("\\b" + k + "\\b", "i").test(e.message));
+      if (drop && attempt < 2) {
+        if (drop === "width" || drop === "height") { delete task.width; delete task.height; } else delete task[drop];
+        logStep("Runware did not accept " + (drop === "width" || drop === "height" ? "a picture size" : drop) + " for " + model + "; sending again without it", "warn");
+        continue;
+      }
+      throw Error("Runware: " + e.message.replace(/^HTTP /, "HTTP "));
+    }
+    if (Date.now() - started > timeoutMs) throw Error("Runware took longer than " + Math.round(timeoutMs / 60000) + " minutes.");
+    const err = (json?.errors || [])[0];
+    if (err) throw Error("Runware: " + (err.message || err.code || "request refused") + (err.parameter ? " (" + err.parameter + ")" : ""));
+    const out = (json?.data || []).find((d) => d?.taskUUID === task.taskUUID) || json?.data?.[0];
+    if (!out) throw Error("Runware answered without a picture.");
+    let blob;
+    if (out.imageDataURI) blob = dataUriBlob(out.imageDataURI);
+    else if (out.imageBase64Data) blob = dataUriBlob("data:image/jpeg;base64," + out.imageBase64Data);
+    else if (out.imageURL) blob = await (await request(out.imageURL, { credentials: "omit", referrerPolicy: "no-referrer" }).catch((e) => { if (relayAddress()) return request(viaRelay(out.imageURL), { credentials: "omit" }); throw e; })).blob();
+    else throw Error("Runware answered without a picture.");
+    logStep("Runware job " + task.taskUUID.slice(0, 8) + ": picture received after " + Math.round((Date.now() - started) / 1000) + "s" + (typeof out.cost === "number" ? " · $" + out.cost.toFixed(4) : ""));
+    return { blob, cost: num(out.cost), taskId: task.taskUUID, mime: blob.type };
   }
 }
 async function spicyImage(prompt, model, ratio, width, height, references, key, timeoutMs = 360000) {
@@ -745,14 +840,14 @@ function costText(result) {
 }
 async function render(prompt, reference, ratio, token = undefined, model = savedModel(Boolean(reference)), traits = "", pair = null, raw = false, caption = "", outfitRef = null, heartExtras = []) {
   token ??= imageKey();
-  if (!model) throw Error("Choose a SpicyAPI image model in Settings and save it.");
+  if (!model) throw Error("Choose a " + imageProviderNames[imageProvider()] + " image model in Settings and save it.");
   const clean = prompt.trim();
   if (!clean) throw Error("Enter an image prompt.");
   const meta = modelMeta(model);
   if (reference && meta?.edit === false)
     throw Error(model + " makes new pictures only. Choose a reference editing model in Settings.");
   // Never send more pictures than the model takes (see refCapacity and the note under the editing model).
-  if (reference) await modelSchema(model).catch(() => null);
+  if (reference && imageProvider() === "spicyapi") await modelSchema(model).catch(() => null);
   const cap = reference ? refCapacity(model).max : 0;
   if (reference && cap < 1) throw Error(model + " does not take reference pictures. Choose an editing model in Settings.");
   if (pair && cap < 2)
@@ -817,13 +912,15 @@ async function render(prompt, reference, ratio, token = undefined, model = saved
   }
   const sentRefs = reference ? [reference, ...moreHearts, ...(pair ? [pair.blob] : []), ...extras.map((o) => o.blob)].slice(0, cap) : [];
   if (submitted.length > limit) throw Error("Shorten the scene to fit the " + limit + "-character prompt limit of " + model + ".");
-  const { blob, cost } = await spicyImage(submitted, model, ratio, width, height, sentRefs, token);
+  const { blob, cost } = imageProvider() === "runware"
+    ? await runwareImage(submitted, model, ratio, width, height, sentRefs, token)
+    : await spicyImage(submitted, model, ratio, width, height, sentRefs, token);
   const head = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
   const type =
     head[0] === 137 && head[1] === 80 ? "png"
       : head[0] === 255 && head[1] === 216 ? "jpeg"
         : String.fromCharCode(...head.slice(8)) === "WEBP" ? "webp" : "";
-  if (!type || blob.size > 30 * 1024 * 1024) throw Error("SpicyAPI returned an unsupported image.");
+  if (!type || blob.size > 30 * 1024 * 1024) throw Error(imageProviderNames[imageProvider()] + " returned an unsupported image.");
   // The short caption is what the chat sees as the picture's description; the full prompt stays in the Gallery.
   const shortCaption = withoutSelfieNote(caption || clean).replace(/\s+/g, " ").slice(0, 400);
   return { blob: blob.slice(0, blob.size, "image/" + type), type, model, submitted, cost, caption: shortCaption, refsSent: sentRefs.length };
@@ -923,7 +1020,7 @@ function framingFor(json, ctx) {
   return ctx?.arena === "conversation" ? "3:4" : "4:3";
 }
 function videoEnabled() {
-  return config.videoOn !== false && Boolean(modelFor("video"));
+  return config.videoOn !== false && Boolean(modelFor("video")) && Boolean(spicyKey());
 }
 async function sceneState(chat) {
   const st = (chat && (await store("settings", "get", "state/" + chat))) || { outfits: {}, mood: null };
@@ -1598,15 +1695,43 @@ function options(select, items) {
   select.replaceChildren(...items.map(([id, text]) => new Option(text, id)));
 }
 const settings = section("Settings and diagnostics", true);
-const keyInput = label(settings, "SpicyAPI key (spicyapi.ai → API keys)", node("input"));
+const imageProviderSelect = label(settings, "Picture provider", node("select"));
+options(imageProviderSelect, [["spicyapi", "SpicyAPI (spicyapi.ai)"], ["runware", "Runware (runware.ai)"]]);
+const keyInput = label(settings, "API key for the picture provider above", node("input"));
 keyInput.type = "password";
 keyInput.autocomplete = "off";
+const keyHint = node("small");
+settings.append(keyHint);
+// Each provider keeps its own key; the box shows the one for the provider picked above.
+const draftKeys = { spicyapi: "", runware: "" };
+function paintKeyHint() {
+  const prov = imageProviderSelect.value;
+  keyInput.placeholder = prov === "runware" ? "Runware API key" : "SpicyAPI key";
+  keyHint.textContent = (prov === "runware" ? "Runware key: my.runware.ai → API Keys." : "SpicyAPI key: spicyapi.ai → API keys.") +
+    " Both keys are kept; switching back shows the other one." + (prov === "runware" ? " Moving photos (🎬) still use SpicyAPI" + (draftKeys.spicyapi ? "." : ": pick SpicyAPI above and enter its key to use them.") : "");
+}
+keyInput.addEventListener("input", () => { draftKeys[imageProviderSelect.value] = keyInput.value; });
+imageProviderSelect.addEventListener("change", () => {
+  keyInput.value = draftKeys[imageProviderSelect.value] || "";
+  imageProviderOverride = imageProviderSelect.value;
+  paintKeyHint();
+  for (const role of ["gen", "edit"]) if (pickers[role]) { pickers[role].touched = false; pickers[role].fill(modelFor(role)); }
+});
+// The form's picture settings, ready to save or test with.
+function imageFormSettings() {
+  const prov = imageProviderSelect.value, pick = (r) => (config.autoConfigured || pickers[r].touched ? pickers[r].value : undefined);
+  const models = prov === "runware" ? { ...config.models } : {}, runwareModels = { ...config.runwareModels };
+  for (const r of ["gen", "edit"]) { const v = pick(r); if (v !== undefined) (prov === "runware" ? runwareModels : models)[r] = v; }
+  const video = pick("video");
+  if (video !== undefined) models.video = video; else if (config.models?.video !== undefined) models.video = config.models.video;
+  return { imageProvider: prov, spicyKey: (draftKeys.spicyapi || "").trim(), runwareKey: (draftKeys.runware || "").trim(), models, runwareModels };
+}
 const textProviderSelect = label(settings, "Writing and vision run on", node("select"));
 options(textProviderSelect, [["nanogpt", "NanoGPT (your main LLM)"], ["spicyapi", "SpicyAPI"]]);
 const nanoKeyInput = label(settings, "NanoGPT key", node("input"));
 nanoKeyInput.type = "password";
 nanoKeyInput.autocomplete = "off";
-settings.append(node("small", "Pictures always use SpicyAPI. Marinara keeps its connection keys encrypted on the server and does not hand them to extensions, so paste the same keys you use in Marinara. They are kept in Marinara’s storage for this extension, so they survive clearing the browser and work on every device."));
+settings.append(node("small", "Marinara keeps its connection keys encrypted on the server and does not hand them to extensions, so paste the same keys you use in Marinara. They are kept in Marinara’s storage for this extension, so they survive clearing the browser and work on every device."));
 
 // A model dropdown: your SpicyAPI connections in Marinara first, then SpicyAPI's live catalogue.
 const pickers = {};
@@ -1633,14 +1758,15 @@ function modelPicker(role, title, allowNone = false) {
         for (const [id, conn] of mine) { g.append(new Option(label4(modelMeta(id, role), id) + " · " + conn, id)); shown.add(id); }
         groups.push(g);
       }
-      const recommended = spicyRoles.has(role) ? spicyKnown.filter(([id, , i]) => (role === "gen" ? i.gen : role === "edit" ? i.edit : i.video) && offered(id) && !shown.has(id)) : [];
+      const known = providerOf(role) === "runware" ? runwareKnown : spicyRoles.has(role) ? spicyKnown : [];
+      const recommended = known.filter(([id, , i]) => (role === "gen" ? i.gen : role === "edit" ? i.edit : i.video) && (providerOf(role) === "runware" || offered(id)) && !shown.has(id));
       if (recommended.length) {
         const g = document.createElement("optgroup");
         g.label = "Recommended";
         for (const [id] of recommended) { g.append(new Option(label4(modelMeta(id), id), id)); shown.add(id); }
         groups.push(g);
       }
-      const listed = (cat.lists[role] || []).filter(([id]) => !shown.has(id));
+      const listed = providerOf(role) === "runware" ? [] : (cat.lists[role] || []).filter(([id]) => !shown.has(id));
       if (listed.length) {
         const g = document.createElement("optgroup");
         g.label = providerName(role) + (role === "vision" && cat === nanoCatalog && cat.visionKnown ? " models that can see images · " : " catalogue · ") + listed.length + (listed.length === 1 ? " model" : " models");
@@ -1674,7 +1800,7 @@ function modelPicker(role, title, allowNone = false) {
         if (!spicyRoles.has(role) && meta.structured) facts.push("JSON mode used automatically");
         if (!spicyRoles.has(role) && (meta.reasoning || /reason|think|r1/i.test(id))) facts.push("reasoning model: longer replies allowed, temperature left to the model");
 
-      } else if (cat.ready) facts.push("not in the " + providerName(role) + " catalogue; it will be sent as typed");
+      } else if (cat.ready) facts.push(providerOf(role) === "runware" ? "not in Likeness’s Runware list; it will be sent as typed (any Runware model id works)" : "not in the " + providerName(role) + " catalogue; it will be sent as typed");
       if (role === "edit") facts.push(capacityText(id));
       if (role === "gen" && wantsTags(id)) facts.push("tag-style model: scenes are written as tags automatically");
       hint.textContent = facts.join(" · ");
@@ -1720,7 +1846,7 @@ async function autoConfigure(force = false) {
     if (conn?.model && connKind(conn) === "text" && (tp === "nanogpt" ? isNanoConnection(conn) : isSpicyConnection(conn))) chatModel = conn.model;
   } catch {}
   const isSet = (role) => {
-    const v = spicyRoles.has(role) ? config.models?.[role] : config.textModels?.[tp]?.[role];
+    const v = imageRoles.has(role) && imageProvider() === "runware" ? config.runwareModels?.[role] : spicyRoles.has(role) ? config.models?.[role] : config.textModels?.[tp]?.[role];
     return v !== undefined && v !== null && (v !== "" || role === "vision" || role === "video");
   };
   const writer = isSet("writer") && !force ? modelFor("writer") : chatModel || modelFor("writer", true);
@@ -1731,20 +1857,21 @@ async function autoConfigure(force = false) {
     edit: [modelFor("edit", true), "keeps the hearted face"],
     video: [modelFor("video", true), "image-to-video"],
   };
-  const models = { ...config.models }, textModels = { ...config.textModels, [tp]: { ...config.textModels?.[tp] } };
+  const models = { ...config.models }, runwareModels = { ...config.runwareModels }, textModels = { ...config.textModels, [tp]: { ...config.textModels?.[tp] } };
   for (const [role, [id, why]] of Object.entries(picks)) {
     if (!id || (isSet(role) && !force)) continue;
-    if (spicyRoles.has(role)) models[role] = id; else textModels[tp][role] = id;
+    if (imageRoles.has(role) && imageProvider() === "runware") runwareModels[role] = id;
+    else if (spicyRoles.has(role)) models[role] = id; else textModels[tp][role] = id;
     done.push(roleNames[role] + ": " + id + " (" + why + ")");
   }
-  config = { ...config, version: 2, models, textModels, textProvider: tp, autoConfigured: true };
+  config = { ...config, version: 2, models, runwareModels, textModels, textProvider: tp, autoConfigured: true };
   await store("settings", "put", "config", config);
   for (const p of Object.values(pickers)) { p.touched = false; p.fill(modelFor(p.role)); }
   updateConnections();
   return done;
 }
 async function maybeAutoConfigure() {
-  if (config.autoConfigured || !spicyKey() || !textKey()) return;
+  if (config.autoConfigured || !imageKey() || !textKey()) return;
   const done = await autoConfigure();
   note(done.length ? "Set up automatically from Marinara and the model catalogues:\n" + done.join("\n") + "\nChange anything in Settings; your choices are kept." : "Settings checked: nothing needed changing.");
 }
@@ -1823,13 +1950,15 @@ function clearTests() {
 async function withFormSettings(fn) {
   const saved = config;
   const tp = textProviderSelect.value;
-  config = { ...config, spicyKey: keyInput.value.trim(), nanoKey: nanoKeyInput.value.trim(), relay: relayAddress(relayInput.value), textProvider: tp, negative: negativeInput.value.trim(),
-    models: { ...config.models, gen: pickers.gen.value, edit: pickers.edit.value, video: pickers.video.value },
+  const prov = imageProviderSelect.value;
+  config = { ...config, imageProvider: prov, spicyKey: (draftKeys.spicyapi || "").trim(), runwareKey: (draftKeys.runware || "").trim(), nanoKey: nanoKeyInput.value.trim(), relay: relayAddress(relayInput.value), textProvider: tp, negative: negativeInput.value.trim(),
+    models: prov === "runware" ? { ...config.models, video: pickers.video.value } : { ...config.models, gen: pickers.gen.value, edit: pickers.edit.value, video: pickers.video.value },
+    runwareModels: prov === "runware" ? { ...config.runwareModels, gen: pickers.gen.value, edit: pickers.edit.value } : config.runwareModels,
     textModels: { ...config.textModels, [tp]: { writer: pickers.writer.value, vision: pickers.vision.value } } };
   try { return await fn(); } finally { config = saved; }
 }
 button(controls, "Auto-configure from Marinara", async () => {
-  config = { ...config, spicyKey: keyInput.value.trim(), nanoKey: nanoKeyInput.value.trim(), textProvider: textProviderSelect.value };
+  config = { ...config, imageProvider: imageProviderSelect.value, spicyKey: (draftKeys.spicyapi || "").trim(), runwareKey: (draftKeys.runware || "").trim(), nanoKey: nanoKeyInput.value.trim(), textProvider: textProviderSelect.value };
   connections = await host("/connections");
   await refreshPickers(true);
   const done = await autoConfigure(true);
@@ -1837,7 +1966,12 @@ button(controls, "Auto-configure from Marinara", async () => {
 });
 // The settings form, filled from the saved settings (at start and after Reload from Marinara).
 function fillForm() {
-  keyInput.value = config.spicyKey || "";
+  imageProviderOverride = null;
+  imageProviderSelect.value = config.imageProvider || "spicyapi";
+  draftKeys.spicyapi = config.spicyKey || "";
+  draftKeys.runware = config.runwareKey || "";
+  keyInput.value = draftKeys[imageProviderSelect.value] || "";
+  paintKeyHint();
   nanoKeyInput.value = config.nanoKey || "";
   textProviderSelect.value = textProvider();
   relayInput.value = config.relay || "";
@@ -1875,7 +2009,7 @@ button(controls, "Save settings", async () => {
   config = {
     ...config,
     version: 2,
-    spicyKey: keyInput.value.trim(),
+    ...imageFormSettings(),
     nanoKey: nanoKeyInput.value.trim(),
     textProvider: textProviderSelect.value,
     relay: relayAddress(relayInput.value),
@@ -1893,10 +2027,10 @@ button(controls, "Save settings", async () => {
     photoText: photoTextSelect.value,
     charGallery: charGallerySelect.value,
     // Before the first automatic setup, only choices you actually made are saved; setup fills the rest.
-    models: Object.fromEntries(["gen", "edit", "video"].filter((r) => config.autoConfigured || pickers[r].touched).map((r) => [r, pickers[r].value])),
     textModels: { ...config.textModels, [textProviderSelect.value]: Object.fromEntries(["writer", "vision"].filter((r) => config.autoConfigured || pickers[r].touched).map((r) => [r, pickers[r].value])) },
   };
   textProviderOverride = null;
+  imageProviderOverride = null;
   if (!config.autoConfigured) refreshPickers(true).then(maybeAutoConfigure).catch(() => {});
   await store("settings", "put", "config", config);
   await autoWatch();
@@ -1905,7 +2039,7 @@ button(controls, "Save settings", async () => {
   if (panel.open) paint().catch(() => {});
   const missing = ["gen", "edit", "writer"].filter((r) => !modelFor(r));
   note(
-    "Settings saved. New pictures: " + savedModel(false) + ". Hearted pictures: " + savedModel(true) +
+    "Settings saved. Pictures from " + imageProviderNames[imageProvider()] + ". New pictures: " + savedModel(false) + ". Hearted pictures: " + savedModel(true) +
       ". Writer (" + textProviderNames[textProvider()] + "): " + (modelFor("writer") || "none") + ". Vision: " + (modelFor("vision") || "none") + "." +
       (missing.length ? " Choose a model for: " + missing.map((r) => roleNames[r]).join(", ") + "." : ""),
   );
@@ -1919,7 +2053,16 @@ button(controls, "Check connection (free)", async () => {
       const h = await publicJson(relay + "/health").catch((e) => ({ failed: e.message }));
       lines.push(h.ok ? "✓ Relay running at " + relay + "." : "✗ Relay not reachable at " + relay + ". Start it with: node likeness-relay.mjs, or clear the relay address.");
     }
-    if (!spicyKey()) lines.push("✗ No SpicyAPI key entered.");
+    if (imageProvider() === "runware") {
+      if (!runwareKey()) lines.push("✗ No Runware key entered.");
+      else {
+        note("Checking Runware…");
+        const r = await request(runwareApi, { method: "POST", credentials: "omit", headers: { "Content-Type": "application/json", Authorization: "Bearer " + runwareKey() }, body: JSON.stringify([{ taskType: "authentication", apiKey: runwareKey() }]) })
+          .then((x) => x.json()).then((j) => (j?.errors?.[0]?.message ? j.errors[0].message : "")).catch((e) => e.message);
+        lines.push(r ? "✗ Runware key check failed: " + r : "✓ Runware key accepted.");
+      }
+    }
+    if (!spicyKey()) lines.push(imageProvider() === "runware" ? "· No SpicyAPI key: moving photos (🎬) are hidden." : "✗ No SpicyAPI key entered.");
     else {
       note("Checking SpicyAPI…");
       const r = await spicy("/models?modality=image").then(() => "", (e) => e.message);
@@ -1960,12 +2103,12 @@ button(controls, "Check connection (free)", async () => {
 });
 button(controls, "Test generation + edit (2 paid image calls)", async () => {
   const gen = pickers.gen.value, edit = pickers.edit.value;
-  if (!keyInput.value.trim()) throw Error("Enter your SpicyAPI key first.");
+  if (!keyInput.value.trim()) throw Error("Enter your " + imageProviderNames[imageProviderSelect.value] + " key first.");
   clearTests();
   await withFormSettings(async () => {
     await loadCatalog().catch(() => {});
     let first, second;
-    note("Step 1 of 2 · generating a test picture with " + gen + "… (SpicyAPI tasks take a few seconds to a minute)");
+    note("Step 1 of 2 · generating a test picture with " + gen + " on " + imageProviderNames[imageProvider()] + "… (this takes a few seconds to a minute)");
     try {
       first = await render("A single green apple on a plain wooden table, soft daylight, product photo.", null, "1:1", undefined, gen, "", null, true);
     } catch (e) {
@@ -2028,7 +2171,7 @@ async function paintArena() {
   const pictures = arena === "conversation"
     ? { off: "pictures when asked", sometimes: "pictures when asked, sometimes on her own", often: "pictures when asked, often on her own" }[config.initiative || "off"]
     : { moments: "key story moments", often: "most vivid story beats", photos: "only photos taken in the story", off: "no story pictures on its own" }[config.story || "moments"];
-  const keys = "SpicyAPI key " + (spicyKey() ? "✓" : "missing") + " · " + textProviderNames[textProvider()] + " key " + (textKey() ? "✓" : "missing");
+  const keys = imageProviderNames[imageProvider()] + " key " + (imageKey() ? "✓" : "missing") + " · " + textProviderNames[textProvider()] + " key " + (textKey() ? "✓" : "missing");
   const where = serverData ? "settings stored in Marinara" : "settings stored in this browser only" + (serverError ? " (" + serverError + ")" : serverStore ? "" : "; this Marinara offers extensions no storage");
   const link = await store("settings", "get", "link/" + chatId).catch(() => null);
   const last = chatStatus.get(chatId);
@@ -2112,7 +2255,7 @@ const smartButton = button(smart, "Enable contextual photos", async () => {
 scopeSelect.addEventListener("change", () => watchLabel(false));
 // Contextual photos run on their own in whichever chat is open, unless you switched them off.
 async function autoWatch() {
-  if (watch?.mode === "context" || config.contextOff || !spicyKey() || !textKey()) return;
+  if (watch?.mode === "context" || config.contextOff || !imageKey() || !textKey()) return;
   watch = { chat: "*", mode: "context", session: uid() };
   await store("settings", "put", "watch", watch);
   lastTurns.clear();
@@ -3607,7 +3750,7 @@ async function poll() {
       const chat = w.chat === "*" ? currentChat() : w.chat;
       if (!chat) return;
       pollChat = chat;
-      const missing = !spicyKey() ? "SpicyAPI key" : !textKey() ? textProviderNames[textProvider()] + " key" : !modelFor("writer") ? "writing model" : "";
+      const missing = !imageKey() ? imageProviderNames[imageProvider()] + " key" : !textKey() ? textProviderNames[textProvider()] + " key" : !modelFor("writer") ? "writing model" : "";
       if (missing) {
         setStatus(chat, "Paused: no " + missing + " is saved. Open ♡ Likeness → Settings.");
         if (warnedMissing !== missing) { warnedMissing = missing; tell("Likeness is paused: no " + missing + " is saved. Open ♡ Likeness → Settings to add it."); }
@@ -3799,7 +3942,7 @@ try {
   await lockedEntries();
   await loadLists(currentChat() || watch?.chat);
   refreshPickers().then(maybeAutoConfigure).catch((e) => { catalogStatus.textContent = "Model lists could not load: " + e.message; });
-  const ready = spicyKey() && textKey();
+  const ready = imageKey() && textKey();
   note(ready ? "Ready." : "Enter your SpicyAPI key" + (textProvider() === "nanogpt" ? " and NanoGPT key" : "") + ", choose models, then save settings.");
   settings.parentElement.open = !ready;
 } catch (e) {
