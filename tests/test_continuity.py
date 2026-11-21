@@ -402,6 +402,14 @@ async def main():
         await page.locator("#chroma-likeness-panel button", has_text="Generate and post").first.click(); await page.wait_for_timeout(4000)
         print("8 RUNWARE REQUESTS:", [l for l in state["log"] if l.startswith("RUNWARE")])
         print("8 POSTED:", [l for l in state["log"] if "POSTED" in l][-1:])
+        # Back to SpicyAPI: its key and models come back, and pictures go to SpicyAPI again
+        await prov.select_option("spicyapi"); await page.wait_for_timeout(300)
+        print("8 BACK ON SPICYAPI key box:", await key.input_value(), "| edit model:", await edit_sel.input_value())
+        await page.locator("#chroma-likeness-panel button", has_text="Save settings").first.click(); await page.wait_for_timeout(1200)
+        n_spicy = len(state["inputs"])
+        await page.locator("#chroma-likeness-panel label", has_text="Scene or image prompt").locator("textarea").fill("Alex reading on the sofa")
+        await page.locator("#chroma-likeness-panel button", has_text="Generate and post").first.click(); await page.wait_for_timeout(4000)
+        print("8 SPICYAPI AGAIN:", [(x["model"], len(x["input"].get("image_urls", []))) for x in state["inputs"][n_spicy:]], "| saved provider:", state["storage"]["config"].get("imageProvider"), "| runware key kept:", state["storage"]["config"].get("runwareKey"))
         await page.locator("#chroma-likeness-panel button", has_text="Close").first.click(); await page.wait_for_timeout(300)
         # 7. Status line for the chat selected in the panel
         await page.click("#chroma-likeness-launch"); await page.wait_for_timeout(1500)

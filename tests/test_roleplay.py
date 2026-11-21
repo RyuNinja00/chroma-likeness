@@ -208,6 +208,7 @@ async def main():
         page = await b.new_page(viewport={"width": 900, "height": 1500})
         await page.route("**/*", handle)
         await page.goto("http://localhost:7860/"); await page.wait_for_timeout(1200)
+        await page.evaluate("window.__markers = []; setInterval(() => { const m = document.querySelector('.chroma-likeness-marker'); const t = m ? m.textContent : ''; if (window.__markers.at(-1) !== t) window.__markers.push(t); }, 100)")
         out = lambda: page.locator("#chroma-likeness-panel output").inner_text()
         sel = lambda t: page.locator("#chroma-likeness-panel label", has_text=t).locator("select")
         inp = lambda t: page.locator("#chroma-likeness-panel label", has_text=t).locator("input")
@@ -250,6 +251,7 @@ async def main():
         state["planner"] = "dare_off"
         await click("Picture the last reply", 4000); print("FORCE:", await out())
         print("PLANNER LOG:", [l for l in state["log"] if l.startswith("PLANNER")])
+        print("MARKER sequence:", await page.evaluate("window.__markers"), "| still showing:", await page.locator(".chroma-likeness-marker").count())
         print("LOG:\n" + await page.evaluate("document.querySelector('#chroma-likeness-panel .activity-log').textContent"))
         print("ERRORS:", await page.evaluate("__errors"))
         print("VIEW RELOADS:", await page.evaluate("__inval"))

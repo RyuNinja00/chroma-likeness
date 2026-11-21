@@ -159,7 +159,7 @@ function paintLog() {
   logBox.textContent = logLines.length ? logText() : "Nothing logged yet.";
   if (atBottom) logBox.scrollTop = logBox.scrollHeight;
 }
-const manifestVersion = "3.1.0";
+const manifestVersion = "3.1.1";
 const shortChat = (id) => "chat …" + String(id || "").slice(-6);
 async function request(url, opts = {}) {
   let r;
@@ -838,8 +838,66 @@ function referenceEditPrompt(scene, traits) {
 function costText(result) {
   return typeof result?.cost === "number" ? " ($" + result.cost.toFixed(4) + ")" : "";
 }
+// ---------- In-chat marker while a picture is being made ----------
+// A small pill just above the message box: "📷 Taking a photo…", gone once the picture is posted.
+// A picture that is made but not posted clears it after a minute, so it never sticks.
+const markerJobs = new Map();
+let markerEl = null, markerTimer = 0, markerSeq = 0;
+function markerStart(text = "📷 Taking a photo…") {
+  const token = ++markerSeq;
+  markerJobs.set(token, { text, at: Date.now() });
+  paintMarker();
+  return token;
+}
+function markerUpdate(token, text) {
+  if (markerJobs.has(token)) { markerJobs.get(token).text = text; paintMarker(); }
+}
+function markerEnd(token) {
+  if (markerJobs.delete(token)) paintMarker();
+}
+function placeMarker() {
+  if (!markerEl) return;
+  const composer = document.querySelector("[data-chat-composer]");
+  const r = composer?.getBoundingClientRect();
+  if (r && r.height) {
+    markerEl.style.bottom = Math.max(8, innerHeight - r.top + 8) + "px";
+    markerEl.style.left = Math.max(8, r.left + 12) + "px";
+  } else { markerEl.style.bottom = "96px"; markerEl.style.left = "16px"; }
+}
+function paintMarker() {
+  if (!alive) return;
+  if (!markerJobs.size) {
+    markerEl?.remove(); markerEl = null;
+    if (markerTimer) { marinara.clearInterval?.(markerTimer); clearInterval(markerTimer); markerTimer = 0; }
+    return;
+  }
+  if (!markerEl) {
+    markerEl = node("div", undefined, "chroma-likeness-marker");
+    markerEl.setAttribute("role", "status");
+    document.body.append(markerEl);
+    markerTimer = marinara.setInterval(placeMarker, 700);
+  }
+  const jobs = [...markerJobs.values()];
+  markerEl.textContent = jobs.at(-1).text + (jobs.length > 1 ? " (" + jobs.length + ")" : "");
+  placeMarker();
+}
 async function render(prompt, reference, ratio, token = undefined, model = savedModel(Boolean(reference)), traits = "", pair = null, raw = false, caption = "", outfitRef = null, heartExtras = []) {
   token ??= imageKey();
+  const mark = raw ? 0 : markerStart();
+  try {
+    const result = await renderPicture(prompt, reference, ratio, token, model, traits, pair, raw, caption, outfitRef, heartExtras);
+    if (mark) {
+      markerUpdate(mark, "📷 Posting the photo…");
+      result.marker = mark;
+      marinara.setTimeout(() => markerEnd(mark), 60000);
+    }
+    return result;
+  } catch (e) {
+    markerEnd(mark);
+    throw e;
+  }
+}
+async function renderPicture(prompt, reference, ratio, token, model, traits, pair, raw, caption, outfitRef, heartExtras) {
   if (!model) throw Error("Choose a " + imageProviderNames[imageProvider()] + " image model in Settings and save it.");
   const clean = prompt.trim();
   if (!clean) throw Error("Enter an image prompt.");
@@ -1167,6 +1225,7 @@ async function deliver(chat, character, results, pictured, lockFlags = [], conte
     const path = imgPath(it.url), lock = index[path];
     return { path: lock ? imgPath(lock.real.url) : path, id: lock ? lock.real.id : it.id, caption: String((lock ? lock.real.prompt : it.prompt) || "").slice(0, 300), chat, at: Date.now() };
   });
+  for (const r of results) markerEnd(r?.marker);
   await addPersonPhotos(pictured, filed).catch(() => {});
   for (let i = 0; i < results.length; i++) if (results[i]?.model !== "scene photo") await addToCharacterGalleries(pictured, results[i], filed[i]?.path).catch(() => {});
   if (pictured.length === 1 && results[0]?.model !== "scene photo") {
@@ -1228,6 +1287,10 @@ async function unlockPhoto(path) {
 }
 // Moving photos: animate a still with the SpicyAPI video model.
 async function animatePicture(row, character) {
+  const mark = markerStart("🎬 Making a moving photo…");
+  try { return await animatePictureNow(row, character); } finally { markerEnd(mark); }
+}
+async function animatePictureNow(row, character) {
   const model = modelFor("video");
   if (!videoEnabled()) throw Error("Moving photos are switched off in Settings.");
   const path = imgPath(row.url);
@@ -1490,6 +1553,7 @@ async function redoPicture(row, scene, who) {
     if (swapped) refreshChatView(chat);
   }
   if (!swapped) await postMedia(chat, c.owner || c.id, [{ ...saved, prompt: result.caption, label: "Redone picture" }], [c.id]);
+  markerEnd(result.marker);
   const newPath = imgPath(saved.url);
   await addPersonPhotos([c.id], [{ path: newPath, id: saved.id, caption: result.caption, chat, at: Date.now() }]).catch(() => {});
   await addToCharacterGalleries([c.id], result, newPath).catch(() => {});
@@ -2464,7 +2528,7 @@ async function pollContext(w, chat = chat, force = false) {
   const photoNote=[typeof plan.raw?.caption==="string" ? plan.raw.caption.trim() : "", typeof plan.raw?.why==="string" && plan.raw.why.trim() ? "why: "+plan.raw.why.trim() : ""].filter(Boolean).join(" — ").slice(0,380);
   const say=ctx.arena==="conversation" && config.photoText!=="off" && typeof plan.raw?.text==="string" ? plan.raw.text.trim().slice(0,300) : "";
   const rendered=await render(scene,refs[0]?.blob,framingFor(plan.raw,ctx),undefined,undefined,traitsForEdit(refs[0]),pair,false,photoNote || plan.scene,outfitRef,second ? [] : refs[0]?.extras?.map((e)=>e.blob));
-  if (!await stillCurrent()) { await upload(chat,rendered); setStatus(chat, "The chat moved on before the picture was ready; it is in the Gallery."); return; }
+  if (!await stillCurrent()) { markerEnd(rendered.marker); await upload(chat,rendered); setStatus(chat, "The chat moved on before the picture was ready; it is in the Gallery."); return; }
   const ids=plan.people.map(c=>c.id);
   const locked=shouldLock(next?.mood || state.mood);
   await deliver(chat,latest.characterId || first.owner || first.id,[rendered],ids,[locked],say);
@@ -3903,6 +3967,7 @@ marinara.onCleanup(() => {
   document.getElementById("chroma-likeness-wardrobe")?.remove();
   launcher.remove();
   flushServer().catch(() => {});
+  markerJobs.clear(); markerEl?.remove();
   dbPromise.then((db) => db.close()).catch(() => {});
 });
 try {

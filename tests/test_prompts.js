@@ -22,13 +22,14 @@ const adultAnchor="All people shown are adults.";
 function modelMeta(m){return catalog.meta.get(m)} function savedModel(){return "seedream"} function imageKey(){return "k"} function wantsTags(){return false}
 function withoutSelfieNote(x){return x}
 async function modelSchema(){}
+function markerStart(){return 0} function markerUpdate(){} function markerEnd(){} const marinara={setTimeout(){}};
 function imageProvider(){return globalThis.PROV||"spicyapi"}
 async function runwareImage(...a){globalThis.RUNWARE_CALLS=(globalThis.RUNWARE_CALLS||0)+1;return spicyImage(...a)}
 async function spicyImage(prompt,model,ratio,w,h,refs){sent={prompt,refs};return {blob:new Blob([new Uint8Array([137,80,78,71,0,0,0,0,0,0,0,0])],{type:"image/png"}),cost:0}}
 `;
 const span = (a, b) => s.slice(s.indexOf(a), s.indexOf(b));
 eval(env + span("const runwareKnown", "function isRunwareConnection") + line("const hairWear") + line("const identityWords") + grab("function referenceEditPrompt") + grab("function refCapacity") + grab("function soloPlan") + grab("function capacityText") +
-  grab("async function render(") + grab("async function outfitReference") + ";globalThis.R=render;globalThis.E=referenceEditPrompt;globalThis.O=outfitReference;globalThis.C=capacityText;globalThis.K=refCapacity;");
+  grab("async function render(") + grab("async function renderPicture(") + grab("async function outfitReference") + ";globalThis.R=render;globalThis.E=referenceEditPrompt;globalThis.O=outfitReference;globalThis.C=capacityText;globalThis.K=refCapacity;");
 const RW = { meta: (m) => eval("runwareCatalog").meta.get(m) };
 const pic = (t) => new Blob([t]);
 const tag = (b) => b && b.size ? b.text() : "";
