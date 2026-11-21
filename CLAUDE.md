@@ -45,6 +45,9 @@ You are picking up **Chroma Likeness**, a Marinara Engine personal extension. Re
 
 ## Known gotchas
 
+- The user reaches Marinara over a Tailscale IP from a phone. Phones sleep and connections drop: polling pauses while the page is hidden, network failures are logged once per outage (`netDown`), SpicyAPI status checks and downloads retry, and a late picture is attached to the reply it was made for (`forMessage`), never dropped.
+- The writer over-reports `wardrobeAdd`; it is only applied when the chat actually asks to save an outfit.
+
 - `crypto.randomUUID` is missing on plain-HTTP LAN origins, so use `uid()`.
 - A CSS `display:grid` rule beat `[hidden]`, so there's a `!important` rule in the CSS.
 - Marinara's chat view caches its messages and won't show messages added through the API until it reloads. `refreshChatView()` finds the React Query client through the React fiber tree and invalidates that chat's queries. If it can't, it fires visibilitychange/focus.

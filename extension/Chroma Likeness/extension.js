@@ -159,7 +159,8 @@ function paintLog() {
   logBox.textContent = logLines.length ? logText() : "Nothing logged yet.";
   if (atBottom) logBox.scrollTop = logBox.scrollHeight;
 }
-const manifestVersion = "3.1.1";
+const manifestVersion = "3.1.2";
+const netDown = new Map(); // host → when it stopped answering
 const shortChat = (id) => "chat …" + String(id || "").slice(-6);
 async function request(url, opts = {}) {
   let r;
@@ -173,7 +174,10 @@ async function request(url, opts = {}) {
     if (e?.name === "AbortError") throw e;
     // fetch() only rejects for network failures and CORS refusals; say which host so it is actionable.
     const where = new URL(url, location.href);
-    logStep("Could not reach " + where.host + where.pathname + ": " + (e?.message || e), "error");
+    if (!netDown.has(where.host)) {
+      netDown.set(where.host, Date.now());
+      logStep("Could not reach " + where.host + where.pathname + ": " + (e?.message || e) + (where.host === location.host ? " (Marinara itself: the phone may be asleep or the connection to your server dropped; Likeness keeps trying quietly)" : ""), "error");
+    }
     throw Error(
       "Could not reach " + where.host + where.pathname +
         " (" + (e?.message || e) + "). The network is down, the address is wrong, or the provider refused a browser (CORS) request.",
@@ -191,6 +195,10 @@ async function request(url, opts = {}) {
     const failure = "HTTP " + r.status + (err ? " — " + String(err).slice(0, 750) : "") + " (" + new URL(url, location.href).pathname + ")";
     logStep((opts.method || "GET") + " " + new URL(url, location.href).pathname + " failed: " + failure, "error");
     throw Error(failure);
+  }
+  {
+    const h = new URL(url, location.href).host;
+    if (netDown.has(h)) { logStep("Connection to " + h + " is back after " + Math.round((Date.now() - netDown.get(h)) / 1000) + "s"); netDown.delete(h); }
   }
   if (opts.method && opts.method !== "GET" && !/recordInfo/.test(url)) logStep(opts.method + " " + new URL(url, location.href).pathname + " → " + r.status);
   return r;
@@ -632,6 +640,7 @@ async function spicyUpload(blob, key) {
 // Runware: one POST with an array of tasks; the picture comes back in the same response (as a data URI,
 // so no second download that a browser could block). Reference pictures go in inputs.referenceImages.
 // If Runware rejects an optional setting for a model (size, negative prompt), it is dropped and sent again.
+const sleep = (ms) => new Promise((done) => marinara.setTimeout(done, ms));
 const runwareApi = "https://api.runware.ai/v1";
 function uuid4() {
   const b = crypto.getRandomValues(new Uint8Array(16));
@@ -697,7 +706,7 @@ async function spicyImage(prompt, model, ratio, width, height, references, key, 
   const taskId = created?.taskId;
   if (!taskId) throw Error("SpicyAPI did not return a task id.");
   logStep("SpicyAPI job " + taskId + " started · " + model + " · " + (references?.length || 0) + " reference picture" + ((references?.length || 0) === 1 ? "" : "s"));
-  let loggedState = "";
+  let loggedState = "", lostContact = false;
   const started = Date.now();
   let task = created;
   for (;;) {
@@ -706,11 +715,14 @@ async function spicyImage(prompt, model, ratio, width, height, references, key, 
     const asset = (task?.output?.assets || []).find((a) => a?.url && !a.pending);
     if (state === "succeeded" && asset) {
       let blob;
-      try {
-        blob = await (await request(asset.url, { credentials: "omit", referrerPolicy: "no-referrer" })).blob();
-      } catch (e) {
-        if (!relayAddress()) throw e;
-        blob = await (await request(viaRelay(asset.url), { credentials: "omit" })).blob();
+      for (let tries = 0; ; tries++) {
+        try {
+          blob = await (await request(relayAddress() && tries % 2 ? viaRelay(asset.url) : asset.url, { credentials: "omit", referrerPolicy: "no-referrer" })).blob();
+          break;
+        } catch (e) {
+          if (tries >= 3) throw e;
+          await sleep(4000);
+        }
       }
       logStep("SpicyAPI job " + taskId + ": picture downloaded after " + Math.round((Date.now() - started) / 1000) + "s");
       return { blob, cost: num(task.cost), taskId, mime: asset.mime || blob.type };
@@ -723,7 +735,15 @@ async function spicyImage(prompt, model, ratio, width, height, references, key, 
     if (waited > 30000 && Math.round(waited / 2500) % 12 === 0) note("Still working on " + model + "… " + Math.floor(waited / 60000) + ":" + String(Math.floor((waited % 60000) / 1000)).padStart(2, "0"));
     await new Promise((r) => marinara.setTimeout(r, 2500));
     if (!alive) throw Error("Extension closed while SpicyAPI was working.");
-    task = unwrap(await (await spicy("/jobs/recordInfo?taskId=" + enc(taskId), key)).json());
+    // The job keeps running at SpicyAPI if the phone sleeps or the connection drops: keep asking.
+    try {
+      task = unwrap(await (await spicy("/jobs/recordInfo?taskId=" + enc(taskId), key)).json());
+      if (lostContact) { lostContact = false; logStep("SpicyAPI job " + taskId + ": back in contact"); }
+    } catch (e) {
+      if (!/Could not reach|HTTP 5\d\d|HTTP 429/.test(e.message)) throw e;
+      if (!lostContact) { lostContact = true; logStep("SpicyAPI job " + taskId + ": lost contact while it runs; still waiting for it", "warn"); }
+      await sleep(5000);
+    }
   }
 }
 function replyText(data) {
@@ -774,7 +794,12 @@ function shapeRequest(body, provider) {
 async function chatCompletion(body, key = textKey(), provider = textProvider()) {
   const shaped = shapeRequest(body, provider);
   try {
-    return await sendChat(shaped, key, provider);
+    return await sendChat(shaped, key, provider).catch(async (e) => {
+      if (!/Could not reach/.test(e.message)) throw e;
+      logStep("The writing model could not be reached; trying again in 4 seconds", "warn");
+      await sleep(4000);
+      return sendChat(shaped, key, provider);
+    });
   } catch (e) {
     // Some models refuse JSON mode; retry once as plain text.
     if (shaped.response_format && /response_format|json_object|json mode|not supported/i.test(e.message)) {
@@ -1203,7 +1228,7 @@ async function teaserFrom(blob) {
   } finally { bitmap.close(); }
 }
 // Upload every result, swap locked ones for teasers, and post them together as one message.
-async function deliver(chat, character, results, pictured, lockFlags = [], content = "") {
+async function deliver(chat, character, results, pictured, lockFlags = [], content = "", forMessage = "") {
   const items = [];
   const index = await lockedEntries();
   for (let i = 0; i < results.length; i++) {
@@ -1220,7 +1245,7 @@ async function deliver(chat, character, results, pictured, lockFlags = [], conte
     for (const [k, v] of Object.entries(index)) if ((v.unlocked || v.created || 0) < cutoff) delete index[k];
     await store("settings", "put", "lockedIndex", index);
   }
-  await postMedia(chat, character, items, pictured, lockFlags.some(Boolean) ? { likenessLocked: true } : {}, content);
+  await postMedia(chat, character, items, pictured, lockFlags.some(Boolean) ? { likenessLocked: true } : {}, content, forMessage);
   const filed = items.map((it) => {
     const path = imgPath(it.url), lock = index[path];
     return { path: lock ? imgPath(lock.real.url) : path, id: lock ? lock.real.id : it.id, caption: String((lock ? lock.real.prompt : it.prompt) || "").slice(0, 300), chat, at: Date.now() };
@@ -1640,17 +1665,18 @@ function refreshChatView(id) {
 }
 // Roleplay shows pictures below the message they belong to and leaves out a message that is only a
 // picture, so there the picture is added to the latest message. Conversation gets its own photo message.
-async function attachToLatest(id, attachments, more) {
-  const rows = (await host("/chats/" + enc(id) + "/messages?limit=16"))
+async function attachToLatest(id, attachments, more, forMessage = "") {
+  const rows = (await host("/chats/" + enc(id) + "/messages?limit=" + (forMessage ? 60 : 16)))
     .filter((m) => m.role === "user" || isReply(m))
     .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
-  const last = rows.at(-1);
+  // A late picture goes under the reply it was made for; otherwise under the latest message.
+  const last = (forMessage && rows.find((m) => m.id === forMessage)) || rows.at(-1);
   if (!last?.id) return false;
   const path = "/chats/" + enc(id) + "/messages/" + enc(last.id);
   const prev = parse(last.extra, {}) || {};
   const next = { ...prev, ...more, attachments: [...(Array.isArray(prev.attachments) ? prev.attachments : []), ...attachments] };
   const landed = async () => {
-    const now = (await host("/chats/" + enc(id) + "/messages?limit=16")).find((m) => m.id === last.id);
+    const now = (await host("/chats/" + enc(id) + "/messages?limit=" + (forMessage ? 60 : 16))).find((m) => m.id === last.id);
     const have = parse(now?.extra, {})?.attachments || [];
     return attachments.every((a) => have.some((h) => h.url === a.url));
   };
@@ -1659,7 +1685,7 @@ async function attachToLatest(id, attachments, more) {
   }
   return false;
 }
-async function postMedia(id, character, items, pictured, extra = {}, content = "") {
+async function postMedia(id, character, items, pictured, extra = {}, content = "", forMessage = "") {
   const attachments = items.map((item) => ({
     type: item.mediaType || "image",
     url: item.url,
@@ -1669,7 +1695,7 @@ async function postMedia(id, character, items, pictured, extra = {}, content = "
     ...(item.mediaType === "video" ? { durationSeconds: item.durationSeconds } : {}),
   }));
   if (!content && (await chatArena(id)) !== "conversation") {
-    if (await attachToLatest(id, attachments, { chromaLikeness: true, likenessCast: pictured, ...extra }).catch((e) => { logStep("Attaching to the reply failed: " + e.message, "warn"); return false; })) {
+    if (await attachToLatest(id, attachments, { chromaLikeness: true, likenessCast: pictured, ...extra }, forMessage).catch((e) => { logStep("Attaching to the reply failed: " + e.message, "warn"); return false; })) {
       logStep(shortChat(id) + ": picture attached to the latest message");
       refreshChatView(id);
       return;
@@ -2476,6 +2502,12 @@ async function pollContext(w, chat = chat, force = false) {
   if (plan && photoTaken && !force && !plan.people.length && plan.raw!==null && alive) plan=await planPicture(turns,roster,state,chat,true,true);
   if (!plan || (!force && watch!==w) || !alive) return;
   // Mood, outfits and wardrobe requests are tracked on every checked reply, photo or not.
+  // Only save an outfit to the wardrobe when the chat actually talks about keeping it.
+  if (plan.raw?.wardrobeAdd) {
+    const userText=String(lastUser && turns.indexOf(lastUser)>=turns.length-3 ? lastUser.content||"" : "");
+    const asked=/\b(wardrobe|closet)\b/i.test(userText+" "+String(latest.content||"")) || /\b(save|keep|add|store|remember)\b[^.!?\n]{0,40}\b(outfit|look|dress|set|clothes|it|this|that|one)\b/i.test(userText);
+    if (!asked) { logStep(shortChat(chat)+": the writer suggested saving an outfit, but nobody asked, so it was not added to the wardrobe"); delete plan.raw.wardrobeAdd; }
+  }
   const next=await absorbState(chat,roster,plan.raw);
   const story=(await chatArena(chat))!=="conversation";
   const level=story ? (config.story || "moments") : (config.initiative || "off");
@@ -2528,10 +2560,11 @@ async function pollContext(w, chat = chat, force = false) {
   const photoNote=[typeof plan.raw?.caption==="string" ? plan.raw.caption.trim() : "", typeof plan.raw?.why==="string" && plan.raw.why.trim() ? "why: "+plan.raw.why.trim() : ""].filter(Boolean).join(" — ").slice(0,380);
   const say=ctx.arena==="conversation" && config.photoText!=="off" && typeof plan.raw?.text==="string" ? plan.raw.text.trim().slice(0,300) : "";
   const rendered=await render(scene,refs[0]?.blob,framingFor(plan.raw,ctx),undefined,undefined,traitsForEdit(refs[0]),pair,false,photoNote || plan.scene,outfitRef,second ? [] : refs[0]?.extras?.map((e)=>e.blob));
-  if (!await stillCurrent()) { markerEnd(rendered.marker); await upload(chat,rendered); setStatus(chat, "The chat moved on before the picture was ready; it is in the Gallery."); return; }
+  const late=!await stillCurrent();
+  if (late) logStep(shortChat(chat)+": newer messages arrived while the picture was made; posting it under the reply it belongs to", "warn");
   const ids=plan.people.map(c=>c.id);
   const locked=shouldLock(next?.mood || state.mood);
-  await deliver(chat,latest.characterId || first.owner || first.id,[rendered],ids,[locked],say);
+  await deliver(chat,latest.characterId || first.owner || first.id,[rendered],ids,[locked],late ? "" : say,late ? latest.id : "");
   setStatus(chat, (photoTaken ? "Pictured the photo taken in the story: " : "Picture posted: ") + plan.people.map(c=>c.name).join(" + ") + (rendered.refsSent ? " · " + rendered.refsSent + " reference picture" + (rendered.refsSent === 1 ? "" : "s") + " sent" : "") + ".");
   await store("settings","put","lastScene/"+chat+"/"+ids.slice().sort().join("|"),plan.scene);
   tell((plan.unprompted&&!userAsked?(ctx.arena==="conversation"?"She sent a photo on her own: ":"Illustrated a story beat: "):"Picture posted: ")+plan.people.map(c=>c.name).join(" + ")+(locked?" (locked).":"."));
@@ -3713,6 +3746,7 @@ let lastPollError = "", pollChat = "", warnedMissing = "";
 const chatStatus = new Map();
 function setStatus(chat, text) {
   if (!chat) return;
+  if (chatStatus.get(chat)?.text === text) { chatStatus.set(chat, { text, at: Date.now() }); return; }
   logStep(shortChat(chat) + ": " + text, /^(Error|Paused)/.test(text) ? "error" : /^No picture|moved on/.test(text) ? "warn" : "info");
   chatStatus.set(chat, { text, at: Date.now() });
   if (panel.open && chat === chatId) paintArena().catch(() => {});
@@ -3801,6 +3835,8 @@ async function checkReturns(chat, info) {
 }
 async function poll() {
   if (!watch || polling || busy || initializing || !alive) return;
+  // A hidden page (phone locked, other app) cannot reach anything reliably: wait until it is visible again.
+  if (document.visibilityState === "hidden") return;
   const w = watch;
   polling = true;
   try {
@@ -3872,8 +3908,8 @@ async function poll() {
     }
     lastPollError = "";
   } catch (e) {
-    if (pollChat) setStatus(pollChat, "Error: " + e.message);
-    if (alive && lastPollError !== e.message) {
+    if (pollChat && !/Could not reach/.test(e.message)) setStatus(pollChat, "Error: " + e.message);
+    if (alive && lastPollError !== e.message && !/Could not reach/.test(e.message)) {
       lastPollError = e.message;
       fail(e);
       if (!panel.open) toastResult("Likeness: " + e.message);

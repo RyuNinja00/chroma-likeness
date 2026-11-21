@@ -169,7 +169,14 @@ async def handle(route):
             tid = "t%d" % len(state["inputs"]); state["tasks"][tid] = 0
             return await j(route, {"data": {"taskId": tid, "state": "queued"}}, 202)
         if "/api/v1/jobs/recordInfo" in url:
-            tid = url.split("taskId=")[1]; state["tasks"][tid] += 1
+            tid = url.split("taskId=")[1]
+            if state.get("drop_record", 0) > 0:
+                state["drop_record"] -= 1; state["log"].append("SPICY status check dropped")
+                return await route.abort("internetdisconnected")
+            if state.pop("add_late_msg", False):
+                state["msgs"]["c2"].append({"id": "n61", "role": "narrator", "content": "She sets the phone down and pours two glasses of wine.", "createdAt": now()})
+                state["log"].append("NEWER REPLY added while the picture is made")
+            state["tasks"][tid] += 1
             if state["tasks"][tid] < 2: return await j(route, {"data": {"taskId": tid, "state": "running"}})
             video = state["inputs"][int(tid[1:]) - 1]["model"].endswith("image-to-video")
             return await j(route, {"data": {"taskId": tid, "state": "succeeded", "cost": 0.08 if video else 0.036, "output": {"assets": [{"url": "https://cdn.spicyapi.test/%s.%s" % (tid, "mp4" if video else "png"), "mime": "video/mp4" if video else "image/png"}]}}})
@@ -411,6 +418,15 @@ async def main():
         await page.locator("#chroma-likeness-panel button", has_text="Generate and post").first.click(); await page.wait_for_timeout(4000)
         print("8 SPICYAPI AGAIN:", [(x["model"], len(x["input"].get("image_urls", []))) for x in state["inputs"][n_spicy:]], "| saved provider:", state["storage"]["config"].get("imageProvider"), "| runware key kept:", state["storage"]["config"].get("runwareKey"))
         await page.locator("#chroma-likeness-panel button", has_text="Close").first.click(); await page.wait_for_timeout(300)
+        # 9. A dropped connection while SpicyAPI works, and a newer reply before the picture is ready
+        state["planner"] = "again"; state["drop_record"] = 1; state["add_late_msg"] = True
+        await page.evaluate("document.querySelector('[data-chat-composer]').dataset.chatId='c2'")
+        await page.wait_for_timeout(2500)
+        state["msgs"]["c2"] += [{"id": "u60", "role": "user", "content": "*I snap a photo of you by the window*", "createdAt": now()},
+                                {"id": "n60", "role": "narrator", "content": "She leans on the windowsill and smiles for the camera.", "createdAt": now()}]
+        await toasts(page, 14)
+        print("9 DROPPED/LATE:", [l for l in state["log"] if l.startswith("SPICY status check dropped") or l.startswith("NEWER REPLY")], "| attached:", [l for l in state["log"] if l.startswith("ATTACHED in c2 to n6")])
+        await page.evaluate("document.querySelector('[data-chat-composer]').dataset.chatId='c1'")
         # 7. Status line for the chat selected in the panel
         await page.click("#chroma-likeness-launch"); await page.wait_for_timeout(1500)
         await page.set_viewport_size({"width": 420, "height": 900}); await page.wait_for_timeout(300)
