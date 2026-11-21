@@ -159,7 +159,7 @@ function paintLog() {
   logBox.textContent = logLines.length ? logText() : "Nothing logged yet.";
   if (atBottom) logBox.scrollTop = logBox.scrollHeight;
 }
-const manifestVersion = "3.1.2";
+const manifestVersion = "3.1.3";
 const netDown = new Map(); // host → when it stopped answering
 const shortChat = (id) => "chat …" + String(id || "").slice(-6);
 async function request(url, opts = {}) {
@@ -452,11 +452,14 @@ function addModel(m, fromSchemaList) {
     catalog.meta.set(id, info);
     return;
   }
-  if (/image/.test(modality) || /text.?to.?image|image.?edit|\/edit$|text-to-image$/.test(id + tasks)) {
+  const props0 = m.inputSchema?.properties || {}, names0 = Object.keys(props0);
+  const imageField = names0.find((n) => /image|ref|frame/i.test(n) && !/mask|format|size|resolution|ratio|count|num/i.test(n));
+  if (/image/.test(modality) || /text.?to.?image|image.?to.?image|image.?edit|\/edit$|\/t2i$|\/i2i$|text-to-image$/.test(id + tasks) || (!/text|chat|llm|language|audio|speech/.test(modality) && !/chat/.test(tasks) && props0.prompt && names0.some((n) => /width|height|size|ratio|resolution|seed/i.test(n)))) {
     if (/video|audio/.test(modality)) return;
     info.image = true;
-    info.gen = /text.?to.?image|t2i/.test(tasks + id) || (!/edit/.test(tasks + id) && known.gen !== false);
-    info.edit = /edit|image.?to.?image|i2i|reference/.test(tasks + id);
+    const required = new Set(Array.isArray(m.inputSchema?.required) ? m.inputSchema.required : []);
+    info.gen = /text.?to.?image|t2i/.test(tasks + id) || (!/edit|image.?to.?image|i2i/.test(tasks + id) && known.gen !== false && !(imageField && required.has(imageField)));
+    info.edit = /edit|image.?to.?image|i2i|reference/.test(tasks + id) || Boolean(imageField);
     const props = m.inputSchema?.properties || {};
     const refProp = Object.entries(props).find(([n, p]) => p?.type === "array" && /image|ref/i.test(n) && !/mask/i.test(n));
     if (refProp) info.maxInputs = refProp[1].maxItems || info.maxInputs;
@@ -465,7 +468,12 @@ function addModel(m, fromSchemaList) {
   } else if (/text|chat|llm|language/.test(modality) || /chat/.test(tasks)) {
     info.text = true;
     if (/vision|image/.test(tasks)) info.vision = true;
-  } else return;
+  } else {
+    // Listed by SpicyAPI but of a kind Likeness can’t tell: keep it, so it is never called “not in the catalogue”.
+    info.unsure = true;
+    catalog.meta.set(id, info);
+    return;
+  }
   catalog.meta.set(id, info);
 }
 async function loadCatalog(force = false) {
@@ -507,6 +515,44 @@ async function loadCatalog(force = false) {
   catalog.error = errors.join("; ");
   catalog.ready = true;
   return catalog;
+}
+// SpicyAPI ids look like maker/model/task. Suggest the listed ids closest to what was typed.
+function closeModels(id, role) {
+  const flat = (x) => String(x || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const want = flat(id), parts = String(id).toLowerCase().split("/").map(flat).filter((x) => x.length > 2);
+  if (!want) return [];
+  const scored = [];
+  for (const [other, info] of catalog.meta) {
+    if (!catalog.live.has(other)) continue;
+    if (role === "edit" && info.edit === false) continue;
+    if (role === "gen" && info.gen === false) continue;
+    if (role === "video" && !info.video) continue;
+    const o = flat(other), name = flat(info.name);
+    let score = 0;
+    if (o.includes(want) || want.includes(o) || (name && (name.includes(want) || want.includes(name)))) score += 3;
+    score += parts.filter((p) => o.includes(p)).length;
+    if (score) scored.push([score, other]);
+  }
+  return scored.sort((a, b) => b[0] - a[0]).slice(0, 3).map(([, x]) => x);
+}
+// A model missing from the list: ask SpicyAPI about it directly before calling it unknown.
+async function lookUpModel(id, key = spicyKey()) {
+  if (!id || catalog.meta.has(id) || !key) return catalog.meta.get(id);
+  try {
+    const r = await spicy("/models/" + id.split("/").map(enc).join("/") + "?includeSchema=1", key);
+    const m = unwrap(await r.json());
+    if (m && typeof m === "object") {
+      addModel({ ...m, model: m.model || m.id || m.modelId || id }, true);
+      logStep("SpicyAPI knows " + id + " although it is not in the model list" + (catalog.meta.get(id)?.unsure ? "; its kind is unclear, so it will be tried as chosen" : ""));
+    }
+  } catch (e) {
+    logStep("SpicyAPI does not recognise the model id " + id + " (" + e.message + ")", "warn");
+  }
+  return catalog.meta.get(id);
+}
+function unknownModelText(id, role) {
+  const near = closeModels(id, role);
+  return "SpicyAPI does not recognise this id. Copy the exact id from SpicyAPI’s model page (it looks like maker/model/task, e.g. bytedance/seedream-5.0-pro/edit)" + (near.length ? ". Closest listed: " + near.join(", ") : "");
 }
 async function modelSchema(model, key = spicyKey()) {
   if (!catalog.schemas.has(model)) {
@@ -1890,7 +1936,14 @@ function modelPicker(role, title, allowNone = false) {
         if (!spicyRoles.has(role) && meta.structured) facts.push("JSON mode used automatically");
         if (!spicyRoles.has(role) && (meta.reasoning || /reason|think|r1/i.test(id))) facts.push("reasoning model: longer replies allowed, temperature left to the model");
 
-      } else if (cat.ready) facts.push(providerOf(role) === "runware" ? "not in Likeness’s Runware list; it will be sent as typed (any Runware model id works)" : "not in the " + providerName(role) + " catalogue; it will be sent as typed");
+        if (meta.unsure) facts.push("listed by SpicyAPI; Likeness can’t tell its kind, so it will be tried as chosen");
+      } else if (cat.ready) {
+        if (cat === catalog && spicyKey() && !p.lookedUp?.has(id)) {
+          (p.lookedUp ||= new Set()).add(id);
+          lookUpModel(id).then((found) => { if (found && p.value === id) p.describe(); });
+        }
+        facts.push(providerOf(role) === "runware" ? "not in Likeness’s Runware list; it will be sent as typed (any Runware model id works)" : cat === catalog ? "⚠ " + unknownModelText(id, role) : "not in the " + providerName(role) + " catalogue; it will be sent as typed");
+      }
       if (role === "edit") facts.push(capacityText(id));
       if (role === "gen" && wantsTags(id)) facts.push("tag-style model: scenes are written as tags automatically");
       hint.textContent = facts.join(" · ");
@@ -2171,12 +2224,14 @@ button(controls, "Check connection (free)", async () => {
     }
     await loadCatalog(true);
     for (const p of Object.values(pickers)) {
-      const id = p.value, meta = modelMeta(id, p.role), cat = catFor(p.role);
+      const id = p.value, cat = catFor(p.role);
+      if (id && cat === catalog && cat.meta.size && !cat.meta.has(id)) await lookUpModel(id);
+      const meta = modelMeta(id, p.role);
       if (!id && p.role === "vision") { lines.push("· vision: none (hearts save without automatic notes)"); continue; }
       if (!id && p.role === "video") { lines.push("· video: none (Animate hidden)"); continue; }
       const bad = !id ? "none chosen"
         : !cat.meta.size ? "catalogue unavailable"
-        : !meta ? "not listed in the " + providerName(p.role) + " catalogue"
+        : !meta ? (cat === catalog ? unknownModelText(id, p.role) : "not listed in the " + providerName(p.role) + " catalogue")
         : p.role === "vision" && meta.vision === false ? "cannot see images"
         : p.role === "edit" && meta.edit === false ? "does not take reference pictures"
         : p.role === "gen" && meta.gen === false ? "needs a reference picture"
@@ -2189,6 +2244,7 @@ button(controls, "Check connection (free)", async () => {
   await store("references", "get", "diagnostics");
   lines.push("✓ Marinara and local storage reachable.");
   for (const p of Object.values(pickers)) p.fill();
+  for (const l of lines) logStep("Check connection: " + l, /^[✗⚠]/.test(l) ? "warn" : "info");
   note(lines.join("\n"));
 });
 button(controls, "Test generation + edit (2 paid image calls)", async () => {
